@@ -1,4 +1,5 @@
 aiogram
-g4f
-curl_cffi
+groq
+motor
+
 
