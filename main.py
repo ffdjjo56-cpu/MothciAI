@@ -1,11 +1,11 @@
-import os, asyncio, logging, psycopg2
+import os, asyncio, logging, psycopg2, re
 import google.generativeai as genai
 from aiogram import Bot, Dispatcher, types
+from aiogram.exceptions import TelegramBadRequest
 
 logging.basicConfig(level=logging.INFO)
 
-# 1. Gemini (Исправляем 404/v1beta со скриншотов 1000029580 и 1000029581)
-# Убираем все лишние параметры, чтобы библиотека сама выбрала стабильный путь
+# 1. Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("gemini-1.5-flash")
 
@@ -18,6 +18,19 @@ def get_db_connection():
 @dp.message()
 async def chat_handler(message: types.Message):
     if not message.text: return
+    
+    # ПРОВЕРКА АКТИВАЦИИ:
+    # 1. Есть ли в тексте слово "Моти"
+    is_called_by_name = re.search(r'\bМоти\b', message.text, re.IGNORECASE)
+    # 2. Является ли это ответом на сообщение самого бота
+    is_reply_to_bot = False
+    if message.reply_to_message and message.reply_to_message.from_user:
+        is_reply_to_bot = message.reply_to_message.from_user.id == bot.id
+
+    # Если ни то, ни другое — игнорируем сообщение
+    if not (is_called_by_name or is_reply_to_bot):
+        return
+
     t_id = getattr(message, 'message_thread_id', None)
 
     conn = None
@@ -25,7 +38,6 @@ async def chat_handler(message: types.Message):
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Создаем таблицу с нормальным ID (вместо rowid со скриншота 1000029581)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -35,43 +47,40 @@ async def chat_handler(message: types.Message):
             )
         """)
         
-        # Сохраняем сообщение
         cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", 
                     (message.from_user.id, "user", message.text))
         
-        # Берем историю по нашему новому полю id (исправляет ошибку 1000029579)
         cur.execute("SELECT role, content FROM messages WHERE user_id = %s ORDER BY id DESC LIMIT 5", 
                     (message.from_user.id,))
         rows = cur.fetchall()[::-1]
         
-        prompt = "Ты Ева, ИИ SatanaClub. Отвечай кратко и дерзко.\n"
+        prompt = "Ты Ева (но тебя называют Моти), ИИ SatanaClub. Отвечай кратко и с характером.\n"
         for r in rows: prompt += f"{r[0]}: {r[1]}\n"
         
-        # Генерация ответа
         response = model.generate_content(prompt)
         answer = response.text
 
-        # Сохраняем ответ Евы
         cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", 
                     (message.from_user.id, "model", answer))
         conn.commit()
         cur.close()
 
-        await message.answer(answer, message_thread_id=t_id)
+        try:
+            await message.reply(answer, message_thread_id=t_id)
+        except:
+            await message.answer(answer)
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        # Если база данных капризничает, просто отвечаем напрямую через ИИ
         try:
             res = model.generate_content(message.text)
-            await message.answer(res.text, message_thread_id=t_id)
+            await message.reply(res.text, message_thread_id=t_id)
         except:
-            await message.answer("Я немного зависла, попробуй еще раз!", message_thread_id=t_id)
+            pass
     finally:
         if conn: conn.close()
 
 async def main():
-    # Чистим очередь, чтобы не было конфликтов (скриншот 1000029567)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
