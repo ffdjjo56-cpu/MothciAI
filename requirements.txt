@@ -2,6 +2,6 @@ aiogram
 groq
 motor
 aiohttp
-
+psycopg2-binary
 
 
