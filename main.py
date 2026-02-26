@@ -4,7 +4,8 @@ from aiogram import Bot, Dispatcher, types
 
 logging.basicConfig(level=logging.INFO)
 
-# 1. Gemini (Исправляем 404 со скриншота 1000029580)
+# 1. Gemini (Исправляем 404/v1beta со скриншотов 1000029580 и 1000029581)
+# Убираем все лишние параметры, чтобы библиотека сама выбрала стабильный путь
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("gemini-1.5-flash")
 
@@ -19,11 +20,12 @@ async def chat_handler(message: types.Message):
     if not message.text: return
     t_id = getattr(message, 'message_thread_id', None)
 
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Создаем таблицу с ID, чтобы не было ошибки "rowid does not exist" (скриншот 1000029579)
+        # Создаем таблицу с нормальным ID (вместо rowid со скриншота 1000029581)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -33,37 +35,43 @@ async def chat_handler(message: types.Message):
             )
         """)
         
-        # Сохраняем
+        # Сохраняем сообщение
         cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", 
                     (message.from_user.id, "user", message.text))
         
-        # Берем историю по ID (вместо rowid)
+        # Берем историю по нашему новому полю id (исправляет ошибку 1000029579)
         cur.execute("SELECT role, content FROM messages WHERE user_id = %s ORDER BY id DESC LIMIT 5", 
                     (message.from_user.id,))
         rows = cur.fetchall()[::-1]
         
-        prompt = "Ты Ева, ИИ SatanaClub. Отвечай кратко.\n"
+        prompt = "Ты Ева, ИИ SatanaClub. Отвечай кратко и дерзко.\n"
         for r in rows: prompt += f"{r[0]}: {r[1]}\n"
         
         # Генерация ответа
         response = model.generate_content(prompt)
         answer = response.text
 
+        # Сохраняем ответ Евы
         cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", 
                     (message.from_user.id, "model", answer))
         conn.commit()
         cur.close()
-        conn.close()
 
         await message.answer(answer, message_thread_id=t_id)
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        # Если база снова выдаст ошибку, просто ответь через ИИ
-        res = model.generate_content(message.text)
-        await message.answer(res.text, message_thread_id=t_id)
+        # Если база данных капризничает, просто отвечаем напрямую через ИИ
+        try:
+            res = model.generate_content(message.text)
+            await message.answer(res.text, message_thread_id=t_id)
+        except:
+            await message.answer("Я немного зависла, попробуй еще раз!", message_thread_id=t_id)
+    finally:
+        if conn: conn.close()
 
 async def main():
+    # Чистим очередь, чтобы не было конфликтов (скриншот 1000029567)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
