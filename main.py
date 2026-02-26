@@ -1,114 +1,71 @@
+import os
 import asyncio
 import logging
-import os
-import urllib.parse
+import psycopg2
 from aiogram import Bot, Dispatcher, types
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.filters import Command
 from groq import Groq
-from motor.motor_asyncio import AsyncIOMotorClient
-from aiohttp import web
-import config
 
-# Настройка логирования
+# Логирование
 logging.basicConfig(level=logging.INFO)
 
-# --- МИНИ ВЕБ-СЕРВЕР ДЛЯ CRON-JOB ---
-async def handle_ping(request):
-    return web.Response(text="Mochi is alive!")
+# Инициализация
+bot = Bot(token=os.getenv("BOT_TOKEN"))
+dp = Dispatcher()
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    # Render сам подставит нужный PORT, если нет - берем 10000
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info(f"Веб-сервер запущен на порту {port}")
+# Подключение к Neon (PostgreSQL)
+def get_db_connection():
+    return psycopg2.connect(os.getenv("DATABASE_URL"))
 
-# --- ОСНОВНОЙ БОТ МОТИ ---
-async def main():
-    logging.info("Mochi AI запускается на Render...")
+# Создание таблицы (если её нет)
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            user_id BIGINT,
+            role TEXT,
+            content TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    cur.close()
+    conn.close()
+
+init_db()
+
+@dp.message()
+async def chat_handler(message: types.Message):
+    user_id = message.from_user.id
+    user_text = message.text
+
+    # Сохраняем сообщение пользователя
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", (user_id, "user", user_text))
     
-    # Запускаем веб-сервер параллельно
-    asyncio.create_task(start_web_server())
+    # Получаем историю (последние 10 сообщений)
+    cur.execute("SELECT role, content FROM messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT 10", (user_id,))
+    history = [{"role": row[0], "content": row[1]} for row in cur.fetchall()][::-1]
     
-    # Исправление ссылки MongoDB для обработки спецсимволов и SSL
-    raw_url = config.MONGO_URL
-    try:
-        if "@" in raw_url.split("://")[-1]:
-            prefix, rest = raw_url.split("://")
-            user_pass, host = rest.split("@", 1)
-            if ":" in user_pass:
-                user, password = user_pass.split(":", 1)
-                encoded_pass = urllib.parse.quote_plus(password)
-                raw_url = f"{prefix}://{user}:{encoded_pass}@{host}"
-    except Exception as e:
-        logging.error(f"Ошибка парсинга URL: {e}")
-
-    # Подключение к MongoDB с защитой от ошибок SSL
-    db_client = AsyncIOMotorClient(
-        raw_url, 
-        tls=True, 
-        tlsAllowInvalidCertificates=True
+    # Запрос к Groq (Eva)
+    response = groq_client.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[{"role": "system", "content": "Твоё имя Ева. Ты помощник проекта SatanaCIub Project."}] + history
     )
-    db = db_client['SatanaclubDB']
-    collection = db['chat_history']
-    
-    bot = Bot(token=config.TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
-    groq_client = Groq(api_key=config.GROQ_API_KEY)
+    answer = response.choices[0].message.content
 
-    @dp.message()
-    async def handle_message(message: types.Message):
-        # Проверка ID чата
-        if message.chat.id != config.ALLOWED_CHAT_ID:
-            return
-        
-        # Игнорируем команды и пустые сообщения
-        if not message.text or message.text.startswith('/'):
-            return
+    # Сохраняем ответ бота
+    cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", (user_id, "assistant", answer))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-        try:
-            # Сохраняем сообщение пользователя
-            await collection.insert_one({
-                "chat_id": message.chat.id, 
-                "role": "user", 
-                "content": message.text
-            })
+    await message.answer(answer)
 
-            # Загружаем историю (последние 15 сообщений)
-            cursor = collection.find({"chat_id": message.chat.id}).sort("_id", -1).limit(15)
-            history = await cursor.to_list(length=15)
-            history.reverse()
-
-            messages = [{"role": "system", "content": config.SYSTEM_PROMPT}]
-            for h in history:
-                messages.append({"role": h["role"], "content": h["content"]})
-
-            # Запрос к нейросети
-            completion = groq_client.chat.completions.create(
-                model="llama3-70b-8192", 
-                messages=messages
-            )
-            answer = completion.choices[0].message.content
-
-            # Сохраняем ответ бота и отправляем его
-            await collection.insert_one({
-                "chat_id": message.chat.id, 
-                "role": "assistant", 
-                "content": answer
-            })
-            await message.reply(answer)
-
-        except Exception as e:
-            logging.error(f"Ошибка при обработке сообщения: {e}")
-
-    # Запуск
-    me = await bot.get_me()
-    logging.info(f"Бот @{me.username} ОНЛАЙН!")
+async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
