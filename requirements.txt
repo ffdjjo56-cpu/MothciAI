@@ -1,5 +1,7 @@
 aiogram
 groq
 motor
+aiohttp
+
 
 
