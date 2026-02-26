@@ -2,9 +2,10 @@ import os, asyncio, logging, psycopg2, re
 import google.generativeai as genai
 from aiogram import Bot, Dispatcher, types
 
+# Логирование для Render
 logging.basicConfig(level=logging.INFO)
 
-# Инициализация модели (исправляем ошибку v1beta со скриншота 1000029595)
+# 1. Gemini: Фикс модели (убираем v1beta из лога 1000029595)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("gemini-1.5-flash")
 
@@ -18,7 +19,7 @@ def get_db_connection():
 async def chat_handler(message: types.Message):
     if not message.text: return
     
-    # Активация на "Моти" или Reply (как ты просил)
+    # Активация: "Моти" или ответ на её сообщение
     is_called = re.search(r'\bМоти\b', message.text, re.IGNORECASE)
     is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot.id if message.reply_to_message else False
 
@@ -30,7 +31,7 @@ async def chat_handler(message: types.Message):
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Исправляем структуру базы (скриншоты 1000029581, 1000029592)
+        # ИСПРАВЛЕНИЕ ТАБЛИЦЫ (Фикс ошибки из лога 1000029592)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -39,37 +40,38 @@ async def chat_handler(message: types.Message):
                 content TEXT
             )
         """)
+        # Принудительно добавляем id, если таблица была создана без него
         cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS id SERIAL PRIMARY KEY")
+        conn.commit()
         
-        # Записываем сообщение
+        # Сохраняем запрос
         cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", 
                     (message.from_user.id, "user", message.text))
         
-        # КОНТЕКСТ 89: Берем последние 89 сообщений из истории
+        # КОНТЕКСТ 89: Загружаем историю
         cur.execute("SELECT role, content FROM messages WHERE user_id = %s ORDER BY id DESC LIMIT 89", 
                     (message.from_user.id,))
         rows = cur.fetchall()[::-1]
         
-        prompt = "Ты Ева (Моти), ИИ SatanaClub. Ты помнишь длинную историю диалога.\n"
-        for r in rows:
-            prompt += f"{r[0]}: {r[1]}\n"
+        prompt = "Ты Ева (Моти), ИИ SatanaClub. У тебя отличная память. Отвечай кратко.\n"
+        for r in rows: prompt += f"{r[0]}: {r[1]}\n"
         
-        # Генерация ответа
+        # Генерация ответа через стабильный API
         response = model.generate_content(prompt)
         answer = response.text
 
-        # Записываем ответ бота
+        # Сохраняем ответ в базу
         cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", 
                     (message.from_user.id, "model", answer))
         conn.commit()
         cur.close()
 
-        # Красивый ответ реплаем
+        # Отвечаем реплаем
         await message.reply(answer, message_thread_id=t_id)
 
     except Exception as e:
-        logging.error(f"Error: {e}")
-        # Если база тупит (как на скрине 1000029592), отвечаем без истории
+        logging.error(f"Ошибка в chat_handler: {e}")
+        # Резервный ответ без истории, если база опять упадет
         try:
             res = model.generate_content(message.text)
             await message.reply(res.text, message_thread_id=t_id)
@@ -78,8 +80,9 @@ async def chat_handler(message: types.Message):
         if conn: conn.close()
 
 async def main():
-    # Сброс ConflictError (скриншоты 1000029585, 1000029593)
+    # ФИКС КОНФЛИКТА (Удаляем старые вебхуки из лога 1000029593)
     await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("Starting bot...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
