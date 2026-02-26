@@ -1,7 +1,5 @@
 aiogram
-groq
-motor
-aiohttp
+google-generativeai
 psycopg2-binary
 
 
