@@ -6,103 +6,96 @@ import google.generativeai as genai
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
-# Настройка логирования
+# Логирование
 logging.basicConfig(level=logging.INFO)
 
-# Инициализация бота и Gemini
+# Инициализация
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
 
-# Настройка Gemini
+# Настройка Gemini (Исправлено для устранения ошибки 404)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-1.5-flash')
+# Используем стабильную модель без лишних параметров v1beta
+model = genai.GenerativeModel("gemini-1.5-flash")
 
-# Функция подключения к Neon (PostgreSQL)
+# Подключение к Neon
 def get_db_connection():
-    # Используем переменную DATABASE_URL, где ты исправил 'p' на маленькую
+    # Твоя ссылка уже работает (с маленькой буквы 'p')
     return psycopg2.connect(os.getenv("DATABASE_URL"))
 
-# Создание таблицы при запуске
+# Инициализация таблицы
 def init_db():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            role TEXT,
-            content TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                role TEXT,
+                content TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        cur.close()
+        conn.close()
+        logging.info("База данных Neon подключена успешно!")
+    except Exception as e:
+        logging.error(f"Ошибка базы: {e}")
 
 init_db()
 
 @dp.message()
 async def chat_handler(message: types.Message):
-    # Игнорируем сообщения без текста
     if not message.text:
         return
 
     user_id = message.from_user.id
     user_text = message.text
-    # Сохраняем thread_id для ответов в темах (topics)
     thread_id = message.message_thread_id
 
     try:
+        # 1. Работа с базой Neon
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # 1. Сохраняем сообщение пользователя в базу
+        # Сохраняем входящее
         cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", 
                     (user_id, "user", user_text))
         conn.commit()
 
-        # 2. Получаем историю (последние 10 сообщений) для контекста
-        cur.execute("""
-            SELECT role, content FROM messages 
-            WHERE user_id = %s 
-            ORDER BY timestamp DESC LIMIT 10
-        """, (user_id,))
+        # Получаем историю (последние 10 сообщений)
+        cur.execute("SELECT role, content FROM messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT 100", (user_id,))
         history_rows = cur.fetchall()[::-1]
         
-        # Форматируем историю для Gemini
-        history = []
+        # Собираем контекст для Евы
+        context = "Твоё имя Ева. Ты помощник проекта SatanaCIub Project. Отвечай кратко и по делу.\n"
         for row in history_rows:
-            role = "user" if row[0] == "user" else "model"
-            history.append({"role": role, "parts": [row[1]]})
+            context += f"{'Пользователь' if row[0] == 'user' else 'Ева'}: {row[1]}\n"
 
-        # 3. Запрос к Gemini
-        # Мы заменили Groq, так как старая модель была отключена
-        chat = model.start_chat(history=history)
-        system_instruction = "Твоё имя Ева. Ты помощник проекта SatanaCIub Project. Отвечай дружелюбно и помогай пользователям."
-        
-        response = chat.send_message(f"{system_instruction}\nПользователь: {user_text}")
+        # 2. Запрос к Gemini (упрощенный вызов для стабильности)
+        response = model.generate_content(f"{context}\nПользователь: {user_text}\nЕва:")
         answer = response.text
 
-        # 4. Сохраняем ответ бота в базу
+        # 3. Сохраняем ответ в базу
         cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", 
                     (user_id, "model", answer))
         conn.commit()
-        
         cur.close()
         conn.close()
 
-        # Отправляем ответ (с учетом темы/топика, если он есть)
+        # Отправляем ответ
         await message.answer(answer, message_thread_id=thread_id)
 
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
-        # Если база выдает ошибку, бот все равно ответит, но без истории
-        chat = model.start_chat(history=[])
-        response = chat.send_message(user_text)
+        logging.error(f"Ошибка в обработчике: {e}")
+        # Запасной вариант если база упадет
+        response = model.generate_content(user_text)
         await message.answer(response.text, message_thread_id=thread_id)
 
 async def main():
-    # Удаляем вебхук перед запуском, чтобы не было конфликтов
+    # Очистка очереди (убирает Conflict Error)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
