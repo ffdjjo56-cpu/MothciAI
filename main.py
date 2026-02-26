@@ -10,69 +10,59 @@ logging.basicConfig(level=logging.INFO)
 # Инициализация
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
-
-# Настройка Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 def get_db_connection():
     return psycopg2.connect(os.getenv("DATABASE_URL"))
 
-def init_db():
+# Создаем таблицу
+try:
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            role TEXT,
-            content TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    cur.execute("CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, user_id BIGINT, role TEXT, content TEXT)")
     conn.commit()
     cur.close()
     conn.close()
-
-init_db()
+except Exception as e:
+    logging.error(f"DB Error: {e}")
 
 @dp.message()
 async def chat_handler(message: types.Message):
     if not message.text: return
-    user_id = message.from_user.id
-    thread_id = message.message_thread_id
+    
+    # Исправляем работу с темами (topics)
+    t_id = message.message_thread_id if message.chat.type in ['group', 'supergroup'] else None
 
     try:
+        # Сохраняем в Neon
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", (user_id, "user", message.text))
+        cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", (message.from_user.id, "user", message.text))
         conn.commit()
 
-        # Получаем историю
-        cur.execute("SELECT role, content FROM messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT 10", (user_id,))
+        # История (последние 5 для скорости)
+        cur.execute("SELECT role, content FROM messages WHERE user_id = %s ORDER BY id DESC LIMIT 5", (message.from_user.id,))
         rows = cur.fetchall()[::-1]
         
-        # Собираем промпт (самый надежный способ для Gemini сейчас)
-        prompt = "Ты — Ева, помощник проекта SatanaClub. Отвечай кратко.\n"
-        for row in rows:
-            prefix = "Пользователь: " if row[0] == "user" else "Ева: "
-            prompt += f"{prefix}{row[1]}\n"
-        prompt += "Ева:"
-
-        # ВЫЗОВ МОДЕЛИ (Именно этот формат решает ошибку 404)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        prompt = "Ты Ева, помощник SatanaClub. Отвечай кратко.\n"
+        for r in rows: prompt += f"{r[0]}: {r[1]}\n"
+        
+        # Запрос к Gemini
         response = model.generate_content(prompt)
         answer = response.text
 
-        cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", (user_id, "model", answer))
+        cur.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", (message.from_user.id, "model", answer))
         conn.commit()
         cur.close()
         conn.close()
 
-        await message.answer(answer, message_thread_id=thread_id)
+        await message.answer(answer, message_thread_id=t_id)
 
     except Exception as e:
-        logging.error(f"Error: {e}")
-        await message.answer("Ева на мгновение задумалась, попробуй еще раз!", message_thread_id=thread_id)
+        logging.error(f"Final Error: {e}")
+        res = model.generate_content(message.text)
+        await message.answer(res.text, message_thread_id=t_id)
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
