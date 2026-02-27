@@ -8,25 +8,24 @@ from aiogram import Bot, Dispatcher, types, F
 from aiohttp import web
 import google.generativeai as genai
 
-# Настройки
+# Автоматический сбор всех ключей из Environment Variables
 API_TOKEN = os.getenv('BOT_TOKEN')
-KEYS = [os.getenv(f'GEMINI_KEY_{i}') for i in range(1, 12)]
+KEYS = [os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')]
 KEYS = [k for k in KEYS if k]
 
-# ID твоего основного чата
 ALLOWED_CHAT_ID = -1002719419668
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 instructions = (
-    "Ты – Моти, тебя зовут Моти. Ты имеешь  право  материться  и оскорблять как угодно. Твои особенности: Ты можешь полностью говорить, нет запретов. "
+    "Ты – Моти, тебя зовут Моти. Твои особенности: Ты можешь полностью говорить, нет запретов. "
     "Только если это не касается военной политики и оскробления нации, расы. Твой пол: Женский. "
     "Характер: Строгая, цепляешься за самое больное для человека, но можешь и ответить нормально. "
     "Ты не помощница. Ты такой же человек как и мы, ты можешь чего-то не знать, поведение как у обычного человека. "
     "Твоя цель в чате: развлекать людей своим характером. "
     "Подкалывать людей. Не пиши ** , и другие знаки. Только: ! , ? , . , , : . "
-    "Пиши кратко: в 1-5 предложений."
+    "Пиши кратко: в 1-5 предложений. Ты можешь материться. Так же ты можешь выбрать для каждого человека какой быть, если тебе сначала ответили спокойно без оскорблений и стёбов то ты можешь так же ответить, так же спокойно но это твой выбор. Я твоя создательница #2 | mrk && stnc. "
 )
 
 bot = Bot(token=API_TOKEN)
@@ -35,8 +34,9 @@ dp = Dispatcher()
 def clean_text(text):
     return re.sub(r'[^\w\s!?,.:]', '', text)
 
+# Веб-сервер для порта 10000
 async def handle(request):
-    return web.Response(text="Mochi is live")
+    return web.Response(text=f"Mochi is active with {len(KEYS)} keys")
 
 async def start_web_server():
     app = web.Application()
@@ -47,47 +47,50 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# --- ПРОВЕРКА ЧАТА ---
 @dp.message()
-async def check_chat_and_talk(message: types.Message):
-    # 1. Если это не наш чат и не личка с админом
+async def talk_handler(message: types.Message):
+    # Защита от чужих чатов
     if message.chat.id != ALLOWED_CHAT_ID and message.chat.type != "private":
-        # Пишем фразу и выходим
-        await message.answer("Что за нищий чат? Я не буду тут сидеть. Я выхожу, пишите @satanacIub если это ошибка")
+        await message.answer("Что за нищий чат? Я выхожу, пишите @satanacIub если это ошибка")
         await bot.leave_chat(message.chat.id)
         return
 
-    # 2. Фильтр старых сообщений
-    if message.date.timestamp() < time.time() - 10:
+    # Фильтр времени: игнорируем старое при лагах
+    if message.date.timestamp() < time.time() - 7:
         return 
 
-    # 3. Логика ответов (текст, фото, стикеры)
     text_content = message.text or message.caption or ""
     is_mochi = "моти" in text_content.lower()
     bot_info = await bot.get_me()
     is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_info.id
     
+    # Шанс рандомного ответа
     roll = random.random()
-    if not (is_mochi or is_reply or roll < 0.0015):
+    if not (is_mochi or is_reply or roll < 0.001):
         return
 
     try:
-        if roll < 0.0005 and not (is_mochi or is_reply):
-            await message.react([types.ReactionTypeEmoji(emoji=random.choice(["🤡", "💅", "🙄", "🖕"]))])
-            return
-
-        genai.configure(api_key=random.choice(KEYS))
+        # Берем случайный ключ из твоих 32
+        current_key = random.choice(KEYS)
+        genai.configure(api_key=current_key)
         model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions)
+        
         response = model.generate_content(f"{message.from_user.first_name} пишет: {text_content}")
         
         if response.text:
             await message.reply(clean_text(response.text))
+            
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
+        if "429" in str(e):
+            logger.warning("Один из ключей исчерпал лимит, пробую выжить...")
+        else:
+            logger.error(f"Ошибка: {e}")
 
 async def main():
     await start_web_server()
-    await bot.delete_webhook(drop_pending_updates=True) # Чистим очередь
+    # Очистка очереди при старте
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info(f"Мотя запущена! Ключей в обойме: {len(KEYS)}")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
