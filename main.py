@@ -7,54 +7,53 @@ import asyncio
 from aiogram import Bot, Dispatcher, types
 import google.generativeai as genai
 
-# 1. Настройки (Берем из Config Vars на сайте Heroku)
+# Подтягиваем секреты из настроек Render
 API_TOKEN = os.getenv('BOT_TOKEN')
 GEMINI_KEY = os.getenv('GEMINI_KEY')
-NEON_URL = os.getenv('NEON_URL') # Ссылка postgresql://...
+NEON_URL = os.getenv('NEON_URL') 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация ИИ
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+# Инициализация Gemini
+if GEMINI_KEY:
+    genai.configure(api_key=GEMINI_KEY)
+    model = genai.GenerativeModel("gemini-1.5-flash")
 
-bot = Bot(token=API_TOKEN)
+bot = Bot(token=API_TOKEN) if API_TOKEN else None
 dp = Dispatcher()
 
-# Функция ТОЛЬКО ЧТЕНИЯ из Neon
-def fetch_history_from_neon(user_id):
+# Функция безопасного чтения из Neon
+def get_neon_history(user_id):
+    conn = None
     try:
         conn = psycopg2.connect(NEON_URL)
         cur = conn.cursor(cursor_factory=DictCursor)
-        # Просто забираем то, что записал юзербот
+        # Ищем историю, которую записал юзербот
         cur.execute("SELECT history FROM chat_history WHERE user_id = %s", (str(user_id),))
         row = cur.fetchone()
         cur.close()
-        conn.close()
-        
-        if row:
-            return json.loads(row['history'])
-        return []
+        return json.loads(row['history']) if row else []
     except Exception as e:
-        logger.error(f"Ошибка чтения из Neon: {e}")
+        logger.error(f"Ошибка чтения Neon: {e}")
         return []
+    finally:
+        if conn: conn.close()
 
 @dp.message()
-async def reader_handler(message: types.Message):
-    if not message.text or message.text.startswith('/'):
+async def talk_handler(message: types.Message):
+    if not message.text or message.text.startswith('/') or not bot:
         return
 
-    # Достаем историю, которую подготовил "писатель" (модуль юзербота)
-    history = fetch_history_from_neon(message.from_user.id)
+    # 1. Читаем то, что подготовил юзербот-писатель в Neon
+    history = get_neon_history(message.from_user.id)
     
-    # Формируем промпт. Мы не добавляем текущее сообщение в базу здесь, 
-    # так как это работа модуля-писателя.
-    prompt = "Ты Моти. Используй историю из базы Neon:\n"
-    prompt += "\n".join(history[-50:]) # Берем последние 50 сообщений для контекста
-    prompt += f"\nUser: {message.text}\nМоти:"
+    # 2. Формируем контекст (последние 100 сообщений)
+    context = "\n".join(history[-100:])
+    prompt = f"Ты Моти, ИИ SatanaClub. Твоя память из Neon:\n{context}\n\nUser: {message.text}\nМоти:"
 
     try:
+        # 3. Генерируем ответ без записи (чтобы не дублировать юзербота)
         response = model.generate_content(prompt)
         await message.answer(response.text)
     except Exception as e:
@@ -62,9 +61,9 @@ async def reader_handler(message: types.Message):
 
 async def main():
     if not all([API_TOKEN, GEMINI_KEY, NEON_URL]):
-        logger.error("Проверь секреты на сайте: BOT_TOKEN, GEMINI_KEY, NEON_URL")
+        logger.error("ОШИБКА: Заполни BOT_TOKEN, GEMINI_KEY и NEON_URL в Environment Variables!")
         return
-    logger.info("Моти-читатель запущена и подключена к Neon.")
+    logger.info("Моти-читатель успешно запущен на Render!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
