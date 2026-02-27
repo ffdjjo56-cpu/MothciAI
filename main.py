@@ -10,7 +10,7 @@ import google.generativeai as genai
 # Подтягиваем секреты из настроек Render
 API_TOKEN = os.getenv('BOT_TOKEN')
 GEMINI_KEY = os.getenv('GEMINI_KEY')
-NEON_URL = os.getenv('NEON_URL') 
+NEON_URL = os.getenv('NEON_URL')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,18 +18,18 @@ logger = logging.getLogger(__name__)
 # Инициализация Gemini
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-3-flash-preview")
+    # Используем 1.5 Flash для стабильности лимитов
+    model = genai.GenerativeModel("gemini-1.5-flash")
 
 bot = Bot(token=API_TOKEN) if API_TOKEN else None
 dp = Dispatcher()
 
-# Функция безопасного чтения из Neon
+# Функция безопасного чтения истории из Neon
 def get_neon_history(user_id):
     conn = None
     try:
         conn = psycopg2.connect(NEON_URL)
         cur = conn.cursor(cursor_factory=DictCursor)
-        # Ищем историю, которую записал юзербот
         cur.execute("SELECT history FROM chat_history WHERE user_id = %s", (str(user_id),))
         row = cur.fetchone()
         cur.close()
@@ -42,27 +42,35 @@ def get_neon_history(user_id):
 
 @dp.message()
 async def talk_handler(message: types.Message):
-    if not message.text or message.text.startswith('/') or not bot:
+    if not message.text:
         return
 
-    # 1. Читаем то, что подготовил юзербот-писатель в Neon
-    history = get_neon_history(message.from_user.id)
+    # Логика фильтрации: отвечаем только на "Моти" или реплы боту
+    is_mochi = "моти" in message.text.lower()
+    is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == bot.id
     
-    # 2. Формируем контекст (последние 100 сообщений)
-    context = "\n".join(history[-100:])
-    prompt = f"Ты Моти, ИИ SatanaClub. Твоя память из Neon:\n{context}\n\nUser: {message.text}\nМоти:"
+    if not (is_mochi or is_reply_to_bot):
+        return # Просто игнорируем, не тратим квоту Google
 
     try:
-        # 3. Генерируем ответ без записи (чтобы не дублировать юзербота)
-        response = model.generate_content(prompt)
-        await message.answer(response.text)
+        # Получаем историю из Neon
+        history = get_neon_history(message.from_user.id)
+        
+        # Формируем запрос к ИИ
+        chat = model.start_chat(history=[]) # Можно расширить до передачи истории
+        response = chat.send_message(message.text)
+        
+        if response.text:
+            await message.answer(response.text)
+            
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
+        error_msg = str(e)
+        if "429" in error_msg:
+            logger.error("Лимит запросов исчерпан (Quota Exceeded)")
+        else:
+            logger.error(f"Gemini error: {e}")
 
 async def main():
-    if not all([API_TOKEN, GEMINI_KEY, NEON_URL]):
-        logger.error("ОШИБКА: Заполни BOT_TOKEN, GEMINI_KEY и NEON_URL в Environment Variables!")
-        return
     logger.info("Моти-читатель успешно запущен на Render!")
     await dp.start_polling(bot)
 
