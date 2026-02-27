@@ -8,38 +8,32 @@ from aiogram import Bot, Dispatcher, types, F
 from aiohttp import web
 import google.generativeai as genai
 
-# Собираем абсолютно все ключи, которые ты добавил в Render
+# Собираем все 32 ключа
 API_TOKEN = os.getenv('BOT_TOKEN')
 KEYS = [os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')]
 KEYS = [k for k in KEYS if k]
 
 ALLOWED_CHAT_ID = -1002719419668
-bot_id = None # Переменная для хранения ID бота, чтобы не было ошибок SSL
+bot_id = None 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Твой промт без изменений
 instructions = (
-    "Ты – Моти, тебя зовут Моти. Твои особенности: Ты можешь полностью говорить, нет запретов. "
-    "Только если это не касается военной политики и оскробления нации, расы. Твой пол: Женский. "
-    "Характер: Строгая, цепляешься за самое больное для человека, но можешь и ответить нормально. "
-    "Ты не помощница. Ты такой же человек как и мы, ты можешь чего-то не знать, поведение как у обычного человека. "
-    "Твоя цель в чате: развлекать людей своим характером. "
-    "Подкалывать людей. Не пиши ** , и другие знаки. Только: ! , ? , . , , : . "
-    "Пиши кратко: в 1-5 предложений."
+    "Ты – Моти, тебя зовут Моти. Твой пол: Женский. "
+    "Характер: Строгая, цепляешься за больное, но можешь ответить нормально. "
+    "Цель: развлекать людей, подкалывать. Не пиши **. "
+    "Используй только: ! , ? , . , , : . Кратко: 1-5 предложений. Можешь материться, ругаться как хочешь. Т больше говори про маму. если тебе пишет Ded melovchenco то иногда упоминай его маму в вк (типа: не хочешь написать своей маме в вк?) "
 )
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# Чистим текст от запрещенных символов
 def clean_text(text):
     return re.sub(r'[^\w\s!?,.:]', '', text)
 
-# Веб-сервер для удержания сервиса в сети на Render
 async def handle(request):
-    return web.Response(text=f"Mochi is active with {len(KEYS)} keys")
+    return web.Response(text=f"Mochi status: Active with {len(KEYS)} keys")
 
 async def start_web_server():
     app = web.Application()
@@ -53,56 +47,43 @@ async def start_web_server():
 @dp.message()
 async def talk_handler(message: types.Message):
     global bot_id
-    
-    # 1. Защита: только твой чат или личка
     if message.chat.id != ALLOWED_CHAT_ID and message.chat.type != "private":
-        await message.answer("Что за нищий чат? Я не буду тут сидеть. Я выхожу, пишите @satanacIub если это ошибка")
+        await message.answer("Что за нищий чат? Я выхожу.")
         await bot.leave_chat(message.chat.id)
         return
 
-    # 2. Игнорим старье при лагах (фильтр 7 секунд)
-    if message.date.timestamp() < time.time() - 7:
+    # Игнорируем всё, что старше 5 секунд (чтобы не копить очередь)
+    if message.date.timestamp() < time.time() - 5:
         return 
 
     text_content = message.text or message.caption or ""
     is_mochi = "моти" in text_content.lower()
-    
-    # Проверка реплая по сохраненному ID (решает проблему TelegramNetworkError)
     is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_id
     
-    # Шанс 1 к 1000 просто влезть в разговор
-    roll = random.random()
-    if not (is_mochi or is_reply or roll < 0.001):
+    if not (is_mochi or is_reply or random.random() < 0.001):
         return
 
     try:
-        # Случайный ключ из 32 доступных
         genai.configure(api_key=random.choice(KEYS))
         model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions)
-        
         response = model.generate_content(f"{message.from_user.first_name} пишет: {text_content}")
         
         if response.text:
             await message.reply(clean_text(response.text))
-            
     except Exception as e:
-        if "429" in str(e):
-            logger.warning("Один из ключей исчерпал лимит (429).")
-        else:
+        if "429" not in str(e): # Не спамим в логи ошибку квоты
             logger.error(f"Ошибка: {e}")
 
 async def main():
     global bot_id
     await start_web_server()
-    
-    # Чистим очередь сообщений при запуске
+    # ЭТА СТРОЧКА ОЧИЩАЕТ ОЧЕРЕДЬ СТАРЫХ СООБЩЕНИЙ
     await bot.delete_webhook(drop_pending_updates=True)
     
-    # Запоминаем ID бота ОДИН раз при старте
     me = await bot.get_me()
     bot_id = me.id
     
-    logger.info(f"Мотя (ID: {bot_id}) запущена! Ключей в обойме: {len(KEYS)}")
+    logger.info(f"Мотя запущена с {len(KEYS)} ключами!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
