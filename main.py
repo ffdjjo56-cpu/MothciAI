@@ -4,10 +4,11 @@ import psycopg2
 from psycopg2.extras import DictCursor
 import json
 import asyncio
+import time
 from aiogram import Bot, Dispatcher, types
 import google.generativeai as genai
 
-# Конфигурация из Render
+# Настройки из Render
 API_TOKEN = os.getenv('BOT_TOKEN')
 GEMINI_KEY = os.getenv('GEMINI_KEY')
 NEON_URL = os.getenv('NEON_URL')
@@ -18,7 +19,6 @@ logger = logging.getLogger(__name__)
 # Инициализация Gemini 3
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-    # Возвращаем твою рабочуми модель
     model = genai.GenerativeModel("gemini-3-flash-preview")
 
 bot = Bot(token=API_TOKEN) if API_TOKEN else None
@@ -41,10 +41,14 @@ def get_neon_history(user_id):
 
 @dp.message()
 async def talk_handler(message: types.Message):
+    # 1. Защита от старой очереди: игнорируем всё, что старше 60 секунд
+    if message.date.timestamp() < time.time() - 60:
+        return 
+
     if not message.text:
         return
 
-    # Фильтр: только если есть "Моти" или реплай боту
+    # 2. Фильтр: только если есть "Моти" или реплай боту
     is_mochi = "моти" in message.text.lower()
     is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == bot.id
     
@@ -52,10 +56,10 @@ async def talk_handler(message: types.Message):
         return 
 
     try:
-        # Получаем контекст
+        # 3. Получаем историю
         history = get_neon_history(message.from_user.id)
         
-        # Запрос к Gemini 3
+        # 4. Запрос к ИИ
         chat = model.start_chat(history=[])
         response = chat.send_message(message.text)
         
@@ -64,12 +68,12 @@ async def talk_handler(message: types.Message):
             
     except Exception as e:
         if "429" in str(e):
-            logger.error("Превышен лимит запросов Gemini 3")
+            logger.error("Квота Gemini исчерпана. Нужно подождать.")
         else:
             logger.error(f"Ошибка Gemini: {e}")
 
 async def main():
-    logger.info("Моти запущена на Gemini 3!")
+    logger.info("Моти запущена на Gemini 3 с защитой от очереди!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
