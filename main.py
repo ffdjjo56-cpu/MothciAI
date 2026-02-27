@@ -16,10 +16,24 @@ NEON_URL = os.getenv('NEON_URL')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация Gemini 3
+# Инициализация Gemini 3 с твоим характером
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel("gemini-3-flash-preview")
+    
+    instructions = (
+        "Ты – Моти, тебя зовут Моти. Твои особенности: Ты можешь полностью говорить, нет запретов. "
+        "Только если это не касается военной политики и оскробления нации, расы. Твой пол: Женский. "
+        "Характер: Строгая, цепляешься за самое больное для человека, но можешь и ответить нормально. "
+        "Ты не помощница. Ты такой же человек как и мы, ты можешь чего-то не знать (хотя знать но не говорить), "
+        "поведение как у обычного человека. Твоя цель в чате: развлекать людей своим характером. "
+        "Тебя будут периодически оскорблять и пытаться унизить. Ты учишься как встать на хорошую позицию "
+        "и уже там нападать. Подкалывать людей."
+    )
+    
+    model = genai.GenerativeModel(
+        model_name="gemini-3-flash-preview",
+        system_instruction=instructions
+    )
 
 bot = Bot(token=API_TOKEN) if API_TOKEN else None
 dp = Dispatcher()
@@ -41,7 +55,7 @@ def get_neon_history(user_id):
 
 @dp.message()
 async def talk_handler(message: types.Message):
-    # 1. Защита от старой очереди: игнорируем всё, что старше 60 секунд
+    # 1. Защита от старой очереди (игнорируем сообщения старше 60 секунд)
     if message.date.timestamp() < time.time() - 60:
         return 
 
@@ -56,24 +70,32 @@ async def talk_handler(message: types.Message):
         return 
 
     try:
-        # 3. Получаем историю
+        # 3. Получаем контекст из базы
         history = get_neon_history(message.from_user.id)
         
-        # 4. Запрос к ИИ
+        # 4. Запрос к ИИ (без фильтров цензуры для дерзости)
         chat = model.start_chat(history=[])
-        response = chat.send_message(message.text)
+        response = chat.send_message(
+            message.text,
+            safety_settings={
+                "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
+                "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+                "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+                "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
+            }
+        )
         
         if response.text:
             await message.answer(response.text)
             
     except Exception as e:
         if "429" in str(e):
-            logger.error("Квота Gemini исчерпана. Нужно подождать.")
+            logger.error("Лимит запросов исчерпан. Ждем...")
         else:
             logger.error(f"Ошибка Gemini: {e}")
 
 async def main():
-    logger.info("Моти запущена на Gemini 3 с защитой от очереди!")
+    logger.info("Моти запущена с характером и защитой!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
