@@ -5,7 +5,8 @@ from psycopg2.extras import DictCursor
 import json
 import asyncio
 import time
-from aiogram import Bot, Dispatcher, types
+import io
+from aiogram import Bot, Dispatcher, types, F
 import google.generativeai as genai
 
 # Настройки из Render
@@ -16,7 +17,7 @@ NEON_URL = os.getenv('NEON_URL')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация Gemini 3 с твоим характером
+# Инициализация Gemini 3 с характером
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
     
@@ -38,51 +39,48 @@ if GEMINI_KEY:
 bot = Bot(token=API_TOKEN) if API_TOKEN else None
 dp = Dispatcher()
 
-def get_neon_history(user_id):
-    conn = None
-    try:
-        conn = psycopg2.connect(NEON_URL)
-        cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT history FROM chat_history WHERE user_id = %s", (str(user_id),))
-        row = cur.fetchone()
-        cur.close()
-        return json.loads(row['history']) if row else []
-    except Exception as e:
-        logger.error(f"Ошибка Neon: {e}")
-        return []
-    finally:
-        if conn: conn.close()
+# Настройки безопасности (чтобы она могла дерзить)
+SAFETY_SETTINGS = {
+    "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
+    "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+    "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
+}
 
-@dp.message()
+@dp.message(F.content_type.in_({'text', 'photo'}))
 async def talk_handler(message: types.Message):
-    # 1. Защита от старой очереди (игнорируем сообщения старше 60 секунд)
+    # 1. Защита от старой очереди
     if message.date.timestamp() < time.time() - 60:
         return 
 
-    if not message.text:
-        return
-
-    # 2. Фильтр: только если есть "Моти" или реплай боту
-    is_mochi = "моти" in message.text.lower()
+    # 2. Проверка: позвали ли Моти (в тексте или подписи к фото) или это реплай
+    text_to_check = message.text or message.caption or ""
+    is_mochi = "моти" in text_to_check.lower()
     is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == bot.id
     
     if not (is_mochi or is_reply_to_bot):
         return 
 
     try:
-        # 3. Получаем контекст из базы
-        history = get_neon_history(message.from_user.id)
+        content = []
+        if text_to_check:
+            content.append(text_to_check)
         
-        # 4. Запрос к ИИ (без фильтров цензуры для дерзости)
-        chat = model.start_chat(history=[])
-        response = chat.send_message(
-            message.text,
-            safety_settings={
-                "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-                "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-                "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-                "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-            }
+        # 3. Если есть фото — скачиваем и добавляем в запрос
+        if message.photo:
+            photo = message.photo[-1] # берем самое лучшее качество
+            file_info = await bot.get_file(photo.file_id)
+            photo_bytes = await bot.download_file(file_info.file_path)
+            
+            content.append({
+                "mime_type": "image/jpeg",
+                "data": photo_bytes.read()
+            })
+
+        # 4. Отправка в Gemini 3
+        response = model.generate_content(
+            content,
+            safety_settings=SAFETY_SETTINGS
         )
         
         if response.text:
@@ -90,12 +88,12 @@ async def talk_handler(message: types.Message):
             
     except Exception as e:
         if "429" in str(e):
-            logger.error("Лимит запросов исчерпан. Ждем...")
+            logger.error("Лимит запросов исчерпан")
         else:
             logger.error(f"Ошибка Gemini: {e}")
 
 async def main():
-    logger.info("Моти запущена с характером и защитой!")
+    logger.info("Моти запущена! Теперь она видит фото и дерзит.")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
