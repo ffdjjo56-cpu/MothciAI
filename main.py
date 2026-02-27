@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # Инициализация Gemini
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel("models/gemini-1.5-pro")
+    model = genai.GenerativeModel("gemini-2.0-flash-exp")
 
 bot = Bot(token=API_TOKEN) if API_TOKEN else None
 dp = Dispatcher()
