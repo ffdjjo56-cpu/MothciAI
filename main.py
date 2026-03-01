@@ -16,7 +16,7 @@ KEYS = [k for k in KEYS if k]
 ALLOWED_CHAT_ID = -1002719419668
 bot_id = None 
 
-# Статистика
+# Статистика ключей
 key_stats = {i: {"used": 0, "status": "✅"} for i in range(len(KEYS))}
 last_reset = time.time()
 
@@ -58,7 +58,7 @@ async def talk_handler(message: types.Message):
 
     text_lower = (message.text or message.caption or "").lower()
 
-    # СБРОС ЛИМИТОВ
+    # СБРОС ЛИМИТОВ РАЗ В МИНУТУ
     if time.time() - last_reset > 60:
         for i in range(len(KEYS)):
             key_stats[i]["used"] = 0
@@ -82,7 +82,7 @@ async def talk_handler(message: types.Message):
     # КОМАНДА: МОТИ ПИНГ
     if "моти пинг" in text_lower:
         ping_ms = int((time.time() - message.date.timestamp()) * 1000)
-        await message.reply(f"<code>Пинг: {ping_ms}ms</code>", parse_mode="HTML")
+        await message.reply(f"<code>Пинг: {ping_ms}ms</code>\nЖивая я, че пристали.", parse_mode="HTML")
         return
 
     is_mochi = "моти" in text_lower
@@ -94,7 +94,8 @@ async def talk_handler(message: types.Message):
     idx = random.randint(0, len(KEYS) - 1)
     try:
         genai.configure(api_key=KEYS[idx])
-        model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=instructions)
+        # УСТАНОВЛЕНА МОДЕЛЬ GEMINI 3 FLASH
+        model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions)
         
         sender = message.from_user.first_name
         if message.reply_to_message and message.reply_to_message.from_user.id != bot_id:
@@ -109,7 +110,8 @@ async def talk_handler(message: types.Message):
             await message.reply(clean_text(response.text))
             
     except Exception as e:
-        if "429" in str(e): key_stats[idx]["status"] = "🚫"
+        if "429" in str(e): 
+            key_stats[idx]["status"] = "🚫"
         logger.error(f"Error: {e}")
 
 async def main():
@@ -118,6 +120,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id = me.id
+    logger.info(f"Мотя на Gemini 3 Flash запущена!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
