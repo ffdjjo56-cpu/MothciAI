@@ -9,7 +9,7 @@ from aiogram.utils.chat_action import ChatActionSender
 from aiohttp import web
 import google.generativeai as genai
 
-# Настройки
+# Настройки ключей
 API_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')])
 SEARCH_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('SEARCH_KEY')])
@@ -24,10 +24,10 @@ last_reset = time.time()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-instructions = (
-    "Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 7 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками **.
-"
-)
+# ТВОЙ ФУЛЛ ПРОМТ (Исправлен синтаксис для Python)
+instructions = """
+Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки которая шарит в музыке. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотри как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 7 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками **.
+"""
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -45,21 +45,15 @@ async def talk_handler(message: types.Message):
     
     if message.chat.id != ALLOWED_CHAT_ID and message.chat.type != "private":
         return
-    
-  if message.date.timestamp() < time.time() - 10:
+    if message.date.timestamp() < time.time() - 20:
         return 
 
     text_content = (message.text or message.caption or "").lower()
     
-    # Сброс лимитов каждые 60 сек
     if time.time() - last_reset > 60:
         for d in [chat_stats, search_stats]:
             for i in d: d[i]["used"], d[i]["status"] = 0, "✅"
         last_reset = time.time()
-
-    if "моти ключи" in text_content:
-        await message.reply(f"📊 Ключей в базе: {len(CHAT_KEYS) + len(SEARCH_KEYS)}")
-        return
 
     search_triggers = ["найди", "поищи", "что это", "ищи"]
     is_search = any(trigger in text_content for trigger in search_triggers)
@@ -69,7 +63,6 @@ async def talk_handler(message: types.Message):
         return
 
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        # Логика выбора пула
         if (is_search or is_more) and SEARCH_KEYS:
             pool, stats = SEARCH_KEYS, search_stats
             tools = [{"google_search_retrieval": {}}]
@@ -77,13 +70,11 @@ async def talk_handler(message: types.Message):
             pool, stats = CHAT_KEYS, chat_stats
             tools = None
 
-        
-        for attempt in range(5):
-            idx = random.randint(0, len(pool) - 1)
-            if stats[idx]["status"] == "🚫": continue
-            
+        # Пробуем ключи, пока не найдем рабочий (защита от 429 ошибки)
+        random.shuffle(pool) 
+        for current_key in pool:
             try:
-                genai.configure(api_key=pool[idx])
+                genai.configure(api_key=current_key)
                 model = genai.GenerativeModel(
                     model_name="gemini-3-flash-preview",
                     system_instruction=instructions,
@@ -95,7 +86,6 @@ async def talk_handler(message: types.Message):
                     response = model.generate_content(query)
                     if response.text:
                         await message.reply(clean_text(response.text))
-                        stats[idx]["used"] += 1
                         return
                 else:
                     response = model.generate_content(query, stream=True)
@@ -105,16 +95,13 @@ async def talk_handler(message: types.Message):
                         if chunk.text:
                             full_text += chunk.text
                     await sent_message.edit_text(clean_text(full_text))
-                    stats[idx]["used"] += 1
                     return
 
             except Exception as e:
-                logger.error(f"Ошибка ключа {idx}: {e}")
-                if "429" in str(e):
-                    stats[idx]["status"] = "🚫"
-                continue # Пробуем следующий ключ
+                logger.error(f"Ошибка ключа: {e}")
+                continue 
         
-        await message.reply("Блин, все ключи сдохли. Попробуй через минуту.")
+        await message.reply("Блин, чет я устала, ключи не пашут.")
 
 async def main():
     global bot_id
@@ -125,7 +112,6 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id = me.id
-    logger.info("Мотя запущена и готова обходить блокировки!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
