@@ -12,14 +12,13 @@ from google.generativeai.types import Tool
 
 # Настройки ключей
 API_TOKEN = os.getenv('BOT_TOKEN')
-# Подгружаем все ключи, которые начинаются с этих префиксов
 CHAT_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')])
 SEARCH_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('SEARCH_KEY')])
 
 ALLOWED_CHAT_ID = -1002719419668
 bot_id = None 
 
-# Динамическая статистика
+# Статистика
 chat_stats = {i: {"used": 0, "status": "✅"} for i in range(len(CHAT_KEYS))}
 search_stats = {i: {"used": 0, "status": "✅"} for i in range(len(SEARCH_KEYS))}
 last_reset = time.time()
@@ -27,14 +26,16 @@ last_reset = time.time()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Твой промт (14-летняя Моти)
+# ОБНОВЛЕННЫЙ ПРОМТ С ПРАВИЛАМИ ПОИСКА
 instructions = (
-    "Моти это ты. Ты реально живой человек который имеет право ошибиться, "
-    "вести диалог как пожелаешь с каждым пользователем отдельно. Тебе 14 лет. "
-    "Интеллект как у обычной 14 летней девочки которая шарит в музыке. "
-    "Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно. "
-    "Имеешь право материться и оскорблять (в т.ч. родителей), смотря как к тебе относятся. "
-    "Никакой политики, расы, дискриминации. До 7 предложений. Не пиши **."
+    "Моти это ты. Тебе 14 лет. Ты живой человек, шаришь в музыке. "
+    "Диалог ведешь как пожелаешь, можешь материться и оскорблять, если тебя бесят. "
+    "ЗАПРЕЩЕНО: политика, расизм, дискриминация. "
+    "Если тебя просят что-то найти ('найди', 'поищи', 'что это', 'ищи'), используй поиск в Google. "
+    "Найденную инфу пересказывай как обычный подросток: кратко, сленгом, без лишней вежливости. "
+    "Если инфы нет — так и говори, типа 'хз, гугл молчит'. "
+    "Не пиши фразы типа 'по результатам поиска...', просто отвечай. "
+    "Длина: до 7 предложений. Не пиши грамотно, если не хочешь. Не используй **."
 )
 
 bot = Bot(token=API_TOKEN)
@@ -44,7 +45,7 @@ def clean_text(text):
     return re.sub(r'[^\w\s!?,.:-]', '', text)
 
 async def handle(request):
-    return web.Response(text=f"Mochi Online. Chat: {len(CHAT_KEYS)}, Search: {len(SEARCH_KEYS)}")
+    return web.Response(text=f"Mochi 3.0 Active. Keys: {len(CHAT_KEYS)} Chat / {len(SEARCH_KEYS)} Search")
 
 async def start_web_server():
     app = web.Application()
@@ -66,7 +67,7 @@ async def talk_handler(message: types.Message):
 
     text_content = (message.text or message.caption or "").lower()
     
-    # Сброс лимитов раз в минуту
+    # Сброс лимитов
     time_since_reset = time.time() - last_reset
     if time_since_reset > 60:
         for d in [chat_stats, search_stats]:
@@ -78,16 +79,19 @@ async def talk_handler(message: types.Message):
     # Команда КЛЮЧИ
     if "моти ключи" in text_content:
         res = f"📊 <b>Лимиты ({int(60-time_since_reset)}с до сброса):</b>\n\n"
-        
         chat_left = sum(max(0, 15-chat_stats[i]['used']) for i in chat_stats)
         res += f"💬 <b>Болталка ({len(CHAT_KEYS)} шт):</b>\n"
         res += f"<blockquote>Осталось запросов: {chat_left}</blockquote>\n"
-        
         search_left = sum(max(0, 15-search_stats[i]['used']) for i in search_stats)
         res += f"🔍 <b>Поиск ({len(SEARCH_KEYS)} шт):</b>\n"
         res += f"<blockquote>Осталось запросов: {search_left}</blockquote>"
-        
         await message.reply(res, parse_mode="HTML")
+        return
+
+    # Команда ПИНГ
+    if "моти пинг" in text_content:
+        ping_ms = int((time.time() - message.date.timestamp()) * 1000)
+        await message.reply(f"<code>Пинг: {ping_ms}ms</code>\nЧе надо?", parse_mode="HTML")
         return
 
     # Триггеры поиска
@@ -99,7 +103,7 @@ async def talk_handler(message: types.Message):
         return
 
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        # Выбор пула ключей
+        # Выбор пула ключей и модели
         if (is_search or is_more) and SEARCH_KEYS:
             pool, stats = SEARCH_KEYS, search_stats
             tools = [Tool.from_google_search_retrieval(google_search_retrieval=genai.types.GoogleSearchRetrieval())]
@@ -110,13 +114,13 @@ async def talk_handler(message: types.Message):
         idx = random.randint(0, len(pool) - 1)
         try:
             genai.configure(api_key=pool[idx])
-            model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=instructions, tools=tools)
+            # СТАВИМ GEMINI 3 FLASH
+            model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions, tools=tools)
             
             query = message.text
             if is_more and message.reply_to_message:
                 query = f"Расскажи максимально подробно про это: {message.reply_to_message.text}"
             
-            # Стриминг
             response = model.generate_content(query, stream=True)
             sent_message = await message.reply("💭")
             
@@ -144,7 +148,6 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id = me.id
-    logger.info(f"Мотя запущена. База: {len(CHAT_KEYS)} чат-ключей и {len(SEARCH_KEYS)} поиск-ключей.")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
