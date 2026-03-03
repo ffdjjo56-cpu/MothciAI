@@ -8,34 +8,33 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.utils.chat_action import ChatActionSender
 from aiohttp import web
 import google.generativeai as genai
+from google.generativeai.types import Tool
 
-# Инициализация настроек
+# Настройки ключей
 API_TOKEN = os.getenv('BOT_TOKEN')
-KEYS = [os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')]
-KEYS = [k for k in KEYS if k]
+# Подгружаем все ключи, которые начинаются с этих префиксов
+CHAT_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')])
+SEARCH_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('SEARCH_KEY')])
 
 ALLOWED_CHAT_ID = -1002719419668
 bot_id = None 
 
-# Статистика ключей
-key_stats = {i: {"used": 0, "status": "✅"} for i in range(len(KEYS))}
+# Динамическая статистика
+chat_stats = {i: {"used": 0, "status": "✅"} for i in range(len(CHAT_KEYS))}
+search_stats = {i: {"used": 0, "status": "✅"} for i in range(len(SEARCH_KEYS))}
 last_reset = time.time()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ТВОЙ ОБНОВЛЕННЫЙ ПРОМТ
+# Твой промт (14-летняя Моти)
 instructions = (
     "Моти это ты. Ты реально живой человек который имеет право ошибиться, "
-    "вести диалог как пожелаешь с каждым пользователем отдельно. "
-    "Ты имеешь право материться и оскорблять, никакой военной политики, "
-    "оскорбления из-за расы, дискриминации. Тебе 14 лет. Об этом можешь не говорить вообще"
-    "Интеллект как у обычной 14 летней девочки."
-    "Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, "
-    "так же у тебя есть выбор, оскорблять человека и его родителей или же нет. "
-    "Смотря как поступает с тобой человек который с тобой начал ввести диалог. "
-    "Предложения до 7 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. "
-    "Не используй выделение текста звездочками **."
+    "вести диалог как пожелаешь с каждым пользователем отдельно. Тебе 14 лет. "
+    "Интеллект как у обычной 14 летней девочки которая шарит в музыке. "
+    "Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно. "
+    "Имеешь право материться и оскорблять (в т.ч. родителей), смотря как к тебе относятся. "
+    "Никакой политики, расы, дискриминации. До 7 предложений. Не пиши **."
 )
 
 bot = Bot(token=API_TOKEN)
@@ -45,7 +44,7 @@ def clean_text(text):
     return re.sub(r'[^\w\s!?,.:-]', '', text)
 
 async def handle(request):
-    return web.Response(text=f"Mochi (14yo) is online. Keys: {len(KEYS)}")
+    return web.Response(text=f"Mochi Online. Chat: {len(CHAT_KEYS)}, Search: {len(SEARCH_KEYS)}")
 
 async def start_web_server():
     app = web.Application()
@@ -65,75 +64,79 @@ async def talk_handler(message: types.Message):
     if message.date.timestamp() < time.time() - 2:
         return 
 
-    text_lower = (message.text or message.caption or "").lower()
-
+    text_content = (message.text or message.caption or "").lower()
+    
     # Сброс лимитов раз в минуту
     time_since_reset = time.time() - last_reset
     if time_since_reset > 60:
-        for i in range(len(KEYS)):
-            key_stats[i]["used"] = 0
-            key_stats[i]["status"] = "✅"
+        for d in [chat_stats, search_stats]:
+            for i in d:
+                d[i]["used"], d[i]["status"] = 0, "✅"
         last_reset = time.time()
         time_since_reset = 0
 
     # Команда КЛЮЧИ
-    if "моти ключи" in text_lower:
-        header = f"📊 <b>Статус ключей ({int(60 - time_since_reset)}с до сброса):</b>\n"
-        body = "<blockquote>"
-        total_left = 0
-        for i in range(len(KEYS)):
-            left = max(0, 20 - key_stats[i]["used"])
-            body += f"{i+1} ключ = {left} зап. / {key_stats[i]['status']}\n"
-            total_left += left
-        body += "</blockquote>"
-        await message.reply(f"{header}{body}\n<b>Всего: {total_left} зап.</b>", parse_mode="HTML")
+    if "моти ключи" in text_content:
+        res = f"📊 <b>Лимиты ({int(60-time_since_reset)}с до сброса):</b>\n\n"
+        
+        chat_left = sum(max(0, 15-chat_stats[i]['used']) for i in chat_stats)
+        res += f"💬 <b>Болталка ({len(CHAT_KEYS)} шт):</b>\n"
+        res += f"<blockquote>Осталось запросов: {chat_left}</blockquote>\n"
+        
+        search_left = sum(max(0, 15-search_stats[i]['used']) for i in search_stats)
+        res += f"🔍 <b>Поиск ({len(SEARCH_KEYS)} шт):</b>\n"
+        res += f"<blockquote>Осталось запросов: {search_left}</blockquote>"
+        
+        await message.reply(res, parse_mode="HTML")
         return
 
-    # Команда ПИНГ
-    if "моти пинг" in text_lower:
-        ping_ms = int((time.time() - message.date.timestamp()) * 1000)
-        await message.reply(f"<code>Пинг: {ping_ms}ms</code>\nЧе надо?", parse_mode="HTML")
+    # Триггеры поиска
+    search_triggers = ["найди", "поищи", "что это", "ищи"]
+    is_search = any(trigger in text_content for trigger in search_triggers)
+    is_more = "побольше" in text_content
+    
+    if not ("моти" in text_content or (message.reply_to_message and message.reply_to_message.from_user.id == bot_id) or is_more):
         return
 
-    # Логика призыва
-    is_mochi = "моти" in text_lower
-    is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == bot_id
-    if not (is_mochi or is_reply_to_bot):
-        return
-
-    # ВКЛЮЧАЕМ СТАТУС "ПЕЧАТАЕТ" И СТРИМИНГ
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        idx = random.randint(0, len(KEYS) - 1)
+        # Выбор пула ключей
+        if (is_search or is_more) and SEARCH_KEYS:
+            pool, stats = SEARCH_KEYS, search_stats
+            tools = [Tool.from_google_search_retrieval(google_search_retrieval=genai.types.GoogleSearchRetrieval())]
+        else:
+            pool, stats = CHAT_KEYS, chat_stats
+            tools = None
+
+        idx = random.randint(0, len(pool) - 1)
         try:
-            genai.configure(api_key=KEYS[idx])
-            model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions)
+            genai.configure(api_key=pool[idx])
+            model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=instructions, tools=tools)
             
-            response = model.generate_content(message.text, stream=True)
-            sent_message = await message.reply("...")
+            query = message.text
+            if is_more and message.reply_to_message:
+                query = f"Расскажи максимально подробно про это: {message.reply_to_message.text}"
             
-            full_text = ""
-            last_edit_time = 0
+            # Стриминг
+            response = model.generate_content(query, stream=True)
+            sent_message = await message.reply("💭")
             
+            full_text, last_edit = "", 0
             for chunk in response:
                 if chunk.text:
                     full_text += chunk.text
-                    # Редактируем раз в 1.2 сек
-                    if time.time() - last_edit_time > 1.2:
+                    if time.time() - last_edit > 1.2:
                         try:
                             await sent_message.edit_text(clean_text(full_text))
-                            last_edit_time = time.time()
-                        except:
-                            pass
+                            last_edit = time.time()
+                        except: pass
             
-            final_text = clean_text(full_text)
-            if final_text:
-                await sent_message.edit_text(final_text)
-                key_stats[idx]["used"] += 1
-
+            final = clean_text(full_text)
+            if final:
+                await sent_message.edit_text(final)
+                stats[idx]["used"] += 1
         except Exception as e:
-            if "429" in str(e): 
-                key_stats[idx]["status"] = "🚫"
-            logger.error(f"Ошибка: {e}")
+            if "429" in str(e): stats[idx]["status"] = "🚫"
+            logger.error(f"Err: {e}")
 
 async def main():
     global bot_id
@@ -141,7 +144,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id = me.id
-    logger.info("Мотя (14 лет) готова к общению!")
+    logger.info(f"Мотя запущена. База: {len(CHAT_KEYS)} чат-ключей и {len(SEARCH_KEYS)} поиск-ключей.")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
