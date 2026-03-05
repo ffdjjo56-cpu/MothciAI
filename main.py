@@ -4,29 +4,27 @@ import asyncio
 import time
 import random
 import re
-from aiogram import Bot, Dispatcher, types, F
+import aiohttp
+from aiogram import Bot, Dispatcher, types
 from aiogram.utils.chat_action import ChatActionSender
 from aiohttp import web
 import google.generativeai as genai
 
-# Настройки ключей
+# --- Конфигурация ---
 API_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')])
 SEARCH_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('SEARCH_KEY')])
+RENDER_URL = os.getenv('RENDER_EXTERNAL_URL') # Ссылка на твоего бота для анти-сна
 
 ALLOWED_CHAT_ID = -1002719419668
 bot_id = None 
 
-chat_stats = {i: {"used": 0, "status": "✅"} for i in range(len(CHAT_KEYS))}
-search_stats = {i: {"used": 0, "status": "✅"} for i in range(len(SEARCH_KEYS))}
-last_reset = time.time()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ТВОЙ ФУЛЛ ПРОМТ (Исправлен синтаксис для Python)
+# Твой оригинальный промт
 instructions = """
-Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотри как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 7 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками **.
+Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 12 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками ** и смайлики. Ты  можешь проявлять симпатию.
 """
 
 bot = Bot(token=API_TOKEN)
@@ -34,85 +32,82 @@ dp = Dispatcher()
 
 def clean_text(text):
     if not text: return ""
-    return re.sub(r'[^\w\s!?,.:-]', '', text)
+    return re.sub(r'[^\w\s!?,.:\-\(\)@]', '', text)
+
+# Функция для поддержки активности (анти-сон Render)
+async def keep_alive():
+    if not RENDER_URL: return
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(RENDER_URL) as resp:
+                    logger.info(f"Статус само-пинга: {resp.status}")
+            except: pass
+            await asyncio.sleep(840) # 14 минут
 
 async def handle(request):
-    return web.Response(text="Mochi 3.0 is running")
+    return web.Response(text="Mochi 3.0 is Online")
 
 @dp.message()
 async def talk_handler(message: types.Message):
-    global bot_id, last_reset
+    global bot_id
     
     if message.chat.id != ALLOWED_CHAT_ID and message.chat.type != "private":
         return
-    if message.date.timestamp() < time.time() - 20:
+    if message.date.timestamp() < time.time() - 30:
         return 
 
     text_content = (message.text or message.caption or "").lower()
     
-    if time.time() - last_reset > 60:
-        for d in [chat_stats, search_stats]:
-            for i in d: d[i]["used"], d[i]["status"] = 0, "✅"
-        last_reset = time.time()
+    # Триггеры для общения
+    is_mochi = "моти" in text_content
+    is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_id
+    is_search = any(x in text_content for x in ["найди", "поищи", "ищи"])
 
-    search_triggers = ["найди", "поищи", "что это", "ищи"]
-    is_search = any(trigger in text_content for trigger in search_triggers)
-    is_more = "побольше" in text_content
-    
-    if not ("моти" in text_content or (message.reply_to_message and message.reply_to_message.from_user.id == bot_id) or is_more):
+    if not (is_mochi or is_reply or is_search):
         return
 
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        if (is_search or is_more) and SEARCH_KEYS:
-            pool, stats = SEARCH_KEYS, search_stats
-            tools = [{"google_search_retrieval": {}}]
-        else:
-            pool, stats = CHAT_KEYS, chat_stats
-            tools = None
-
-        # Пробуем ключи, пока не найдем рабочий (защита от 429 ошибки)
-        random.shuffle(pool) 
-        for current_key in pool:
+        pool = SEARCH_KEYS if is_search else CHAT_KEYS
+        if not pool: pool = CHAT_KEYS
+        
+        random.shuffle(pool)
+        for key in pool[:5]:
             try:
-                genai.configure(api_key=current_key)
-                model = genai.GenerativeModel(
-                    model_name="gemini-3-flash-preview",
-                    system_instruction=instructions,
-                    tools=tools
-                )
+                genai.configure(api_key=key)
+                model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions)
                 
-                query = message.text or "Привет"
-                if tools:
-                    response = model.generate_content(query)
-                    if response.text:
-                        await message.reply(clean_text(response.text))
-                        return
-                else:
-                    response = model.generate_content(query, stream=True)
-                    sent_message = await message.reply("💭")
-                    full_text = ""
-                    for chunk in response:
-                        if chunk.text:
-                            full_text += chunk.text
-                    await sent_message.edit_text(clean_text(full_text))
+                # Только текст, без фото
+                response = await asyncio.to_thread(model.generate_content, text_content)
+                
+                if response and response.text:
+                    await message.reply(clean_text(response.text))
                     return
-
             except Exception as e:
                 logger.error(f"Ошибка ключа: {e}")
-                continue 
+                continue
         
-        await message.reply("Блин, чет я устала, ключи не пашут.")
+        await message.reply("Чет я приуныла, ключи не пашут.")
 
 async def main():
     global bot_id
-    app = web.Application(); app.router.add_get("/", handle)
-    runner = web.AppRunner(app); await runner.setup()
+    # Запуск сервера
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
     
+    # Запуск анти-сна
+    asyncio.create_task(keep_alive())
+
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id = me.id
+    logger.info("Мотя запущена в режиме общения.")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except: pass
