@@ -7,6 +7,7 @@ import re
 import aiohttp
 import psycopg2 
 from aiogram import Bot, Dispatcher, types
+from aiogram.client.default import DefaultBotProperties # Новый импорт для фикса ошибки
 from aiogram.utils.chat_action import ChatActionSender
 from aiohttp import web
 import google.generativeai as genai
@@ -17,14 +18,14 @@ DB_URL = os.getenv('DATABASE_URL')
 CHAT_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')])
 RENDER_URL = os.getenv('RENDER_EXTERNAL_URL')
 
-# Белый лист: старый и новый чаты
+# Белый лист
 ALLOWED_CHATS = [-1002719419668, -1003371184723] 
 bot_id = None 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Работа с базой данных Neon ---
+# --- База данных Neon ---
 def init_db():
     try:
         conn = psycopg2.connect(DB_URL)
@@ -41,7 +42,6 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("База данных Neon инициализирована.")
     except Exception as e:
         logger.error(f"Ошибка БД: {e}")
 
@@ -56,7 +56,7 @@ def save_message(chat_id, role, content):
     except Exception as e:
         logger.error(f"Ошибка сохранения: {e}")
 
-def get_history(chat_id, limit=200): # Лимит 200 сообщений
+def get_history(chat_id, limit=200): # Память 200 сообщений
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
@@ -75,12 +75,16 @@ def get_history(chat_id, limit=200): # Лимит 200 сообщений
         logger.error(f"Ошибка истории: {e}")
         return ""
 
-# Твой промт: 14 лет, 9 предложений, без музыки
+# Твой промт: 9 предложений, без музыки
 instructions = """
 Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 9 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками ** и смайлики. Ты можешь проявлять симпатию.
 """
 
-bot = Bot(token=API_TOKEN, parse_mode="HTML") # HTML для цитат
+# ИСПРАВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ (фикс ошибки из логов)
+bot = Bot(
+    token=API_TOKEN, 
+    default=DefaultBotProperties(parse_mode="HTML")
+)
 dp = Dispatcher()
 
 def clean_text(text):
@@ -95,34 +99,29 @@ async def keep_alive():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
+                # В логах видно статус 200 — анти-сон работает!
                 async with session.get(RENDER_URL) as resp:
                     logger.info(f"Статус само-пинга: {resp.status}")
             except: pass
-            await asyncio.sleep(840) # 14 минут
+            await asyncio.sleep(840)
 
 async def handle(request):
-    return web.Response(text="Mochi is active in two chats")
+    return web.Response(text="Mochi is active and updated")
 
 @dp.message()
 async def talk_handler(message: types.Message):
     global bot_id
     chat_id = message.chat.id
-    
-    # Проверка белого листа и лички
-    if chat_id not in ALLOWED_CHATS and message.chat.type != "private": 
-        return
-    if message.date.timestamp() < time.time() - 30: 
-        return 
+    if chat_id not in ALLOWED_CHATS and message.chat.type != "private": return
+    if message.date.timestamp() < time.time() - 30: return 
 
     text_content = (message.text or message.caption or "").lower()
     is_mochi = "моти" in text_content
     is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_id
 
-    if not (is_mochi or is_reply): 
-        return
+    if not (is_mochi or is_reply): return
 
     async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
-        # Сохраняем и получаем контекст (200 сообщений)
         await asyncio.to_thread(save_message, chat_id, "Пользователь", text_content)
         history_context = await asyncio.to_thread(get_history, chat_id)
         full_prompt = f"История диалога:\n{history_context}\n\nПользователь: {text_content}"
@@ -146,7 +145,6 @@ async def talk_handler(message: types.Message):
 async def main():
     global bot_id
     init_db() 
-    
     app = web.Application(); app.router.add_get("/", handle)
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
@@ -155,7 +153,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id = me.id
-    logger.info("Мотя запущена с памятью Neon.")
+    logger.info("Мотя запущена с фиксом parse_mode.")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
