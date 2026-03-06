@@ -6,6 +6,8 @@ import random
 import re
 import aiohttp
 import psycopg2 
+import pytz
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.chat_action import ChatActionSender
@@ -24,12 +26,11 @@ bot_id = None
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Исправленная работа с БД Neon ---
+# --- База данных Neon (500 сообщений) ---
 def init_db():
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
-        # Сносим старую таблицу, если она без нужных колонок, и создаем заново
         cur.execute("DROP TABLE IF EXISTS chat_history") 
         cur.execute("""
             CREATE TABLE chat_history (
@@ -43,9 +44,9 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("Таблица chat_history пересоздана успешно.")
+        logger.info("БД инициализирована.")
     except Exception as e:
-        logger.error(f"Ошибка БД при инициализации: {e}")
+        logger.error(f"Ошибка БД: {e}")
 
 def save_message(chat_id, role, content):
     try:
@@ -56,9 +57,9 @@ def save_message(chat_id, role, content):
         cur.close()
         conn.close()
     except Exception as e:
-        logger.error(f"Ошибка сохранения: {e}") # Тот самый Error из логов
+        logger.error(f"Ошибка сохранения: {e}")
 
-def get_history(chat_id, limit=200):
+def get_history(chat_id, limit=500): # Увеличено до 500
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
@@ -77,12 +78,10 @@ def get_history(chat_id, limit=200):
         logger.error(f"Ошибка истории: {e}")
         return ""
 
-# Твой промт (12 предложений, без смайлов)
 instructions = """
 Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 12 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками ** и смайлики. Ты можешь проявлять симпатию.
 """
 
-# Инициализация бота с фиксом parse_mode
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -103,11 +102,18 @@ async def keep_alive():
             await asyncio.sleep(840)
 
 async def handle(request):
-    return web.Response(text="Mochi Gemini 3 Preview Fix Active")
+    return web.Response(text="Moti 500msg Memory Active")
 
 @dp.message()
 async def talk_handler(message: types.Message):
     global bot_id
+    
+    # Режим сна (01:00 - 07:00 МСК)
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    now = datetime.now(moscow_tz)
+    if 1 <= now.hour < 7:
+        return 
+
     chat_id = message.chat.id
     if chat_id not in ALLOWED_CHATS and message.chat.type != "private": return
     if message.date.timestamp() < time.time() - 30: return 
@@ -118,17 +124,21 @@ async def talk_handler(message: types.Message):
 
     if not (is_mochi or is_reply): return
 
+    # Получаем ник или имя пользователя для памяти
+    user_display = message.from_user.username or message.from_user.first_name or "Аноним"
+
     async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
-        await asyncio.to_thread(save_message, chat_id, "Пользователь", text_content)
+        # Сохраняем с ником пользователя
+        await asyncio.to_thread(save_message, chat_id, user_display, text_content)
         history_context = await asyncio.to_thread(get_history, chat_id)
-        full_prompt = f"История диалога:\n{history_context}\n\nПользователь: {text_content}"
+        
+        full_prompt = f"История диалога:\n{history_context}\n\nТы — Моти. Ответь пользователю {user_display}: {text_content}"
 
         pool = CHAT_KEYS
         random.shuffle(pool)
         for key in pool[:5]:
             try:
                 genai.configure(api_key=key)
-                # Gemini 3 Preview
                 model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions)
                 response = await asyncio.to_thread(model.generate_content, full_prompt)
                 
@@ -151,7 +161,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id = me.id
-    logger.info("Мотя запущена с исправленной БД.")
+    logger.info("Мотя запущена (Memory: 500).")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
