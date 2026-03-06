@@ -42,6 +42,7 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
+        logger.info("БД Neon подключена.")
     except Exception as e:
         logger.error(f"Ошибка БД: {e}")
 
@@ -75,12 +76,12 @@ def get_history(chat_id, limit=200):
         logger.error(f"Ошибка истории: {e}")
         return ""
 
-# Промт Моти (9 предложений)
+# Промт (9 предложений)
 instructions = """
 Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 9 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками ** и смайлики. Ты можешь проявлять симпатию.
 """
 
-# Инициализация бота с фиксом для aiogram 3.7+
+# Фикс инициализации для новых версий aiogram
 bot = Bot(
     token=API_TOKEN, 
     default=DefaultBotProperties(parse_mode="HTML")
@@ -104,7 +105,7 @@ async def keep_alive():
             await asyncio.sleep(840)
 
 async def handle(request):
-    return web.Response(text="Moti on Gemini 3 is active")
+    return web.Response(text="Moti Gemini 3 Preview Active")
 
 @dp.message()
 async def talk_handler(message: types.Message):
@@ -129,8 +130,8 @@ async def talk_handler(message: types.Message):
         for key in pool[:5]:
             try:
                 genai.configure(api_key=key)
-                # УСТАНОВКА GEMINI 3 FLASH
-                model = genai.GenerativeModel("gemini-3-flash", system_instruction=instructions)
+                # Переход на Preview-версию Gemini 3
+                model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions)
                 response = await asyncio.to_thread(model.generate_content, full_prompt)
                 
                 if response and response.text:
@@ -152,7 +153,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id = me.id
-    logger.info("Мотя запущена на Gemini 3.")
+    logger.info("Мотя запущена на Gemini 3 Preview.")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
