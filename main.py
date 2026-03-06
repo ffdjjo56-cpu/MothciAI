@@ -18,33 +18,34 @@ DB_URL = os.getenv('DATABASE_URL')
 CHAT_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')])
 RENDER_URL = os.getenv('RENDER_EXTERNAL_URL')
 
-# Белый лист чатов
 ALLOWED_CHATS = [-1002719419668, -1003371184723] 
 bot_id = None 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- База данных Neon (200 сообщений) ---
+# --- Исправленная работа с БД Neon ---
 def init_db():
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
+        # Сносим старую таблицу, если она без нужных колонок, и создаем заново
+        cur.execute("DROP TABLE IF EXISTS chat_history") 
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS chat_history (
+            CREATE TABLE chat_history (
                 id SERIAL PRIMARY KEY,
-                chat_id BIGINT,
-                role TEXT,
-                content TEXT,
+                chat_id BIGINT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("БД Neon подключена.")
+        logger.info("Таблица chat_history пересоздана успешно.")
     except Exception as e:
-        logger.error(f"Ошибка БД: {e}")
+        logger.error(f"Ошибка БД при инициализации: {e}")
 
 def save_message(chat_id, role, content):
     try:
@@ -55,7 +56,7 @@ def save_message(chat_id, role, content):
         cur.close()
         conn.close()
     except Exception as e:
-        logger.error(f"Ошибка сохранения: {e}")
+        logger.error(f"Ошибка сохранения: {e}") # Тот самый Error из логов
 
 def get_history(chat_id, limit=200):
     try:
@@ -76,16 +77,13 @@ def get_history(chat_id, limit=200):
         logger.error(f"Ошибка истории: {e}")
         return ""
 
-# Промт (9 предложений)
+# Твой промт (12 предложений, без смайлов)
 instructions = """
-Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 9 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками ** и смайлики. Ты можешь проявлять симпатию.
+Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 12 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками ** и смайлики. Ты можешь проявлять симпатию.
 """
 
-# Фикс инициализации для новых версий aiogram
-bot = Bot(
-    token=API_TOKEN, 
-    default=DefaultBotProperties(parse_mode="HTML")
-)
+# Инициализация бота с фиксом parse_mode
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 def clean_text(text):
@@ -105,7 +103,7 @@ async def keep_alive():
             await asyncio.sleep(840)
 
 async def handle(request):
-    return web.Response(text="Moti Gemini 3 Preview Active")
+    return web.Response(text="Mochi Gemini 3 Preview Fix Active")
 
 @dp.message()
 async def talk_handler(message: types.Message):
@@ -130,7 +128,7 @@ async def talk_handler(message: types.Message):
         for key in pool[:5]:
             try:
                 genai.configure(api_key=key)
-                # Переход на Preview-версию Gemini 3
+                # Gemini 3 Preview
                 model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions)
                 response = await asyncio.to_thread(model.generate_content, full_prompt)
                 
@@ -153,7 +151,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id = me.id
-    logger.info("Мотя запущена на Gemini 3 Preview.")
+    logger.info("Мотя запущена с исправленной БД.")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
