@@ -7,7 +7,7 @@ import re
 import aiohttp
 import psycopg2 
 from aiogram import Bot, Dispatcher, types
-from aiogram.client.default import DefaultBotProperties # Новый импорт для фикса ошибки
+from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.chat_action import ChatActionSender
 from aiohttp import web
 import google.generativeai as genai
@@ -18,14 +18,14 @@ DB_URL = os.getenv('DATABASE_URL')
 CHAT_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')])
 RENDER_URL = os.getenv('RENDER_EXTERNAL_URL')
 
-# Белый лист
+# Белый лист чатов
 ALLOWED_CHATS = [-1002719419668, -1003371184723] 
 bot_id = None 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- База данных Neon ---
+# --- База данных Neon (200 сообщений) ---
 def init_db():
     try:
         conn = psycopg2.connect(DB_URL)
@@ -56,7 +56,7 @@ def save_message(chat_id, role, content):
     except Exception as e:
         logger.error(f"Ошибка сохранения: {e}")
 
-def get_history(chat_id, limit=200): # Память 200 сообщений
+def get_history(chat_id, limit=200):
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
@@ -75,12 +75,12 @@ def get_history(chat_id, limit=200): # Память 200 сообщений
         logger.error(f"Ошибка истории: {e}")
         return ""
 
-# Твой промт: 9 предложений, без музыки
+# Промт Моти (9 предложений)
 instructions = """
 Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 9 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками ** и смайлики. Ты можешь проявлять симпатию.
 """
 
-# ИСПРАВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ (фикс ошибки из логов)
+# Инициализация бота с фиксом для aiogram 3.7+
 bot = Bot(
     token=API_TOKEN, 
     default=DefaultBotProperties(parse_mode="HTML")
@@ -90,7 +90,6 @@ dp = Dispatcher()
 def clean_text(text):
     if not text: return ""
     cleaned = re.sub(r'[^\w\s!?,.:\-\(\)@]', '', text)
-    # Свёрнутая цитата
     return f"<blockquote expandable>{cleaned}</blockquote>"
 
 async def keep_alive():
@@ -99,14 +98,13 @@ async def keep_alive():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                # В логах видно статус 200 — анти-сон работает!
                 async with session.get(RENDER_URL) as resp:
                     logger.info(f"Статус само-пинга: {resp.status}")
             except: pass
             await asyncio.sleep(840)
 
 async def handle(request):
-    return web.Response(text="Mochi is active and updated")
+    return web.Response(text="Moti on Gemini 3 is active")
 
 @dp.message()
 async def talk_handler(message: types.Message):
@@ -131,7 +129,8 @@ async def talk_handler(message: types.Message):
         for key in pool[:5]:
             try:
                 genai.configure(api_key=key)
-                model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=instructions)
+                # УСТАНОВКА GEMINI 3 FLASH
+                model = genai.GenerativeModel("gemini-3-flash", system_instruction=instructions)
                 response = await asyncio.to_thread(model.generate_content, full_prompt)
                 
                 if response and response.text:
@@ -153,7 +152,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id = me.id
-    logger.info("Мотя запущена с фиксом parse_mode.")
+    logger.info("Мотя запущена на Gemini 3.")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
