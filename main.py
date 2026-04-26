@@ -1,170 +1,127 @@
 import os
-import logging
 import asyncio
-import time
 import random
-import re
-import aiohttp
-import psycopg2 
-import pytz
-from datetime import datetime
-from aiogram import Bot, Dispatcher, types
+import logging
+import io
+import asyncpg
+import edge_tts
+import pytesseract
+import PIL.Image
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.chat_action import ChatActionSender
-from aiohttp import web
+from aiogram.types import BufferedInputFile
 import google.generativeai as genai
 
-# --- Конфигурация ---
 API_TOKEN = os.getenv('BOT_TOKEN')
-DB_URL = os.getenv('DATABASE_URL') 
-CHAT_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')])
-RENDER_URL = os.getenv('RENDER_EXTERNAL_URL')
+DB_URL = os.getenv('DATABASE_URL')
+if DB_URL and DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
-ALLOWED_CHATS = [-1002719419668, -1003371184723] 
-bot_id = None 
+CHAT_KEYS = [os.getenv(k) for k in os.environ if "GEMINI_KEY" in k]
+ALLOWED_CHATS = [-1003371184723, -1002719419668]
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- База данных Neon (500 сообщений) ---
-def init_db():
-    try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        cur.execute("DROP TABLE IF EXISTS chat_history") 
-        cur.execute("""
-            CREATE TABLE chat_history (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-        cur.close()
-        conn.close()
-        logger.info("БД инициализирована.")
-    except Exception as e:
-        logger.error(f"Ошибка БД: {e}")
-
-def save_message(chat_id, role, content):
-    try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        cur.execute("INSERT INTO chat_history (chat_id, role, content) VALUES (%s, %s, %s)", (chat_id, role, content))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Ошибка сохранения: {e}")
-
-def get_history(chat_id, limit=500): # Увеличено до 500
-    try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT role, content FROM (
-                SELECT role, content, created_at FROM chat_history 
-                WHERE chat_id = %s 
-                ORDER BY created_at DESC LIMIT %s
-            ) sub ORDER BY created_at ASC
-        """, (chat_id, limit))
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return "\n".join([f"{r}: {c}" for r, c in rows])
-    except Exception as e:
-        logger.error(f"Ошибка истории: {e}")
-        return ""
-
-instructions = """
-Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 12 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками ** и смайлики. Ты можешь проявлять симпатию.
-"""
-
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
+db_pool = None
+failed_keys = {}
 
-def clean_text(text):
-    if not text: return ""
-    cleaned = re.sub(r'[^\w\s!?,.:\-\(\)@]', '', text)
-    return f"<blockquote expandable>{cleaned}</blockquote>"
+INSTRUCTIONS = "Ты — Моти, 14-летняя токсичная школьница. Дерзкая, используешь сленг. Отвечай коротко, без капса."
 
-async def keep_alive():
-    if not RENDER_URL: return
-    await asyncio.sleep(30)
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                async with session.get(RENDER_URL) as resp:
-                    logger.info(f"Статус само-пинга: {resp.status}")
-            except: pass
-            await asyncio.sleep(840)
+async def get_best_key():
+    now = datetime.now()
+    available = [k for k in CHAT_KEYS if k not in failed_keys or failed_keys[k]['blocked_until'] < now]
+    return random.choice(available) if available else None
 
-async def handle(request):
-    return web.Response(text="Moti 500msg Memory Active")
+def mark_key_failed(key):
+    now = datetime.now()
+    if key not in failed_keys:
+        failed_keys[key] = {'fails': 1, 'blocked_until': now}
+    else:
+        failed_keys[key]['fails'] += 1
+        if failed_keys[key]['fails'] >= 3:
+            failed_keys[key]['blocked_until'] = now + timedelta(minutes=3)
+
+def mark_key_success(key):
+    if key in failed_keys: failed_keys[key]['fails'] = 0
+
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DB_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (chat_id BIGINT, role TEXT, content TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS user_rep (user_id BIGINT PRIMARY KEY, points FLOAT DEFAULT 5.0);
+        """)
+
+async def get_voice(text):
+    communicate = edge_tts.Communicate(text, "ru-RU-SvetlanaNeural")
+    fp = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio": fp.write(chunk["data"])
+    fp.seek(0)
+    return BufferedInputFile(fp.read(), filename="moti.ogg")
 
 @dp.message()
 async def talk_handler(message: types.Message):
-    global bot_id
+    if message.chat.id not in ALLOWED_CHATS:
+        return
+
+    user_id = message.from_user.id
+    text = (message.text or message.caption or "").lower()
+    bot_info = await bot.get_me()
+
+    is_moti = "моти" in text or "мотя" in text
+    is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_info.id
     
-    # Режим сна (01:00 - 07:00 МСК)
-    moscow_tz = pytz.timezone('Europe/Moscow')
-    now = datetime.now(moscow_tz)
-    if 1 <= now.hour < 7:
-        return 
+    ocr_text = ""
+    if message.photo and is_moti:
+        file = await bot.get_file(message.photo[-1].file_id)
+        img_data = await bot.download_file(file.file_path)
+        ocr_text = await asyncio.to_thread(pytesseract.image_to_string, PIL.Image.open(io.BytesIO(img_data.read())), lang='rus+eng')
 
-    chat_id = message.chat.id
-    if chat_id not in ALLOWED_CHATS and message.chat.type != "private": return
-    if message.date.timestamp() < time.time() - 30: return 
+    if not (is_moti or is_reply): return
 
-    text_content = (message.text or message.caption or "").lower()
-    is_mochi = "моти" in text_content
-    is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_id
+    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
+        async with db_pool.acquire() as conn:
+            rep = await conn.fetchval("SELECT points FROM user_rep WHERE user_id = $1", user_id) or 5.0
 
-    if not (is_mochi or is_reply): return
+        prompt = f"{INSTRUCTIONS}\nРепа: {rep}/5\n"
+        if ocr_text: prompt += f"(Текст на фото: {ocr_text})\n"
+        prompt += f"Юзер: {text}"
 
-    # Получаем ник или имя пользователя для памяти
-    user_display = message.from_user.username or message.from_user.first_name or "Аноним"
-
-    async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
-        # Сохраняем с ником пользователя
-        await asyncio.to_thread(save_message, chat_id, user_display, text_content)
-        history_context = await asyncio.to_thread(get_history, chat_id)
-        
-        full_prompt = f"История диалога:\n{history_context}\n\nТы — Моти. Ответь пользователю {user_display}: {text_content}"
-
-        pool = CHAT_KEYS
-        random.shuffle(pool)
-        for key in pool[:5]:
+        reply_text = None
+        for _ in range(5):
+            key = await get_best_key()
+            if not key: break
             try:
                 genai.configure(api_key=key)
-                model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions)
-                response = await asyncio.to_thread(model.generate_content, full_prompt)
-                
-                if response and response.text:
-                    await asyncio.to_thread(save_message, chat_id, "Моти", response.text)
-                    await message.reply(clean_text(response.text))
-                    return
-            except Exception as e:
-                logger.error(f"Ошибка ключа: {e}")
-                continue
+                model = genai.GenerativeModel("gemini-1.5-flash")
+                response = await asyncio.to_thread(model.generate_content, prompt)
+                reply_text = response.text.replace("*", "")
+                mark_key_success(key)
+                break
+            except:
+                mark_key_failed(key)
+
+        if not reply_text: return
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO chat_history (chat_id, role, content) VALUES ($1, $2, $3)", message.chat.id, message.from_user.first_name, text)
+
+        final_msg = f"<blockquote>{reply_text}</blockquote>\n<b>Репутация {round(rep, 1)}</b>"
+
+        if random.random() < 0.2:
+            await message.reply_voice(await get_voice(reply_text))
+            await message.answer(f"<b>Репутация {round(rep, 1)}</b>")
+        else:
+            await message.reply(final_msg)
 
 async def main():
-    global bot_id
-    init_db() 
-    app = web.Application(); app.router.add_get("/", handle)
-    runner = web.AppRunner(app); await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
-    
-    asyncio.create_task(keep_alive())
-    await bot.delete_webhook(drop_pending_updates=True)
-    me = await bot.get_me()
-    bot_id = me.id
-    logger.info("Мотя запущена (Memory: 500).")
+    await init_db()
     await dp.start_polling(bot)
 
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except: pass
+if __name__ == "__main__":
+    asyncio.run(main())
