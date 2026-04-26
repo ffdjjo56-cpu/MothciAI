@@ -1,8 +1,15 @@
 aiogram==3.18.0
 google-generativeai
-psycopg2-binary
 pydantic==2.10.6
 aiohttp
 pytz
 Pillow
-gTTS
+edge-tts       
+asyncpg        
+redis          
+orjson         
+beautifulsoup4
+emoji          
+pytesseract
+replicate
+giphy-client
