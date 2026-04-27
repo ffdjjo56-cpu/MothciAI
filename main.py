@@ -20,7 +20,8 @@ if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
 CHAT_KEYS = [os.getenv(k) for k in os.environ if "GEMINI_KEY" in k]
-ALLOWED_CHATS = [-1003371184723, -1002719419668]
+raw_chats = os.getenv('ALLOWED_CHATS', '')
+ALLOWED_CHATS = [int(i.strip()) for i in raw_chats.split(',') if i.strip()]
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
