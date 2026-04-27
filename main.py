@@ -8,10 +8,10 @@ import edge_tts
 import pytesseract
 import PIL.Image
 from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, types, F
+from aiohttp import web
+from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.chat_action import ChatActionSender
-from aiogram.types import BufferedInputFile
 import google.generativeai as genai
 
 API_TOKEN = os.getenv('BOT_TOKEN')
@@ -31,6 +31,18 @@ failed_keys = {}
 
 INSTRUCTIONS = "Ты — Моти, 14-летняя токсичная школьница. Дерзкая, используешь сленг. Отвечай коротко, без капса."
 
+async def handle_health_check(request):
+    return web.Response(text="Moti is alive")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
 async def get_best_key():
     now = datetime.now()
     available = [k for k in CHAT_KEYS if k not in failed_keys or failed_keys[k]['blocked_until'] < now]
@@ -44,9 +56,6 @@ def mark_key_failed(key):
         failed_keys[key]['fails'] += 1
         if failed_keys[key]['fails'] >= 3:
             failed_keys[key]['blocked_until'] = now + timedelta(minutes=3)
-
-def mark_key_success(key):
-    if key in failed_keys: failed_keys[key]['fails'] = 0
 
 async def init_db():
     global db_pool
@@ -63,17 +72,14 @@ async def get_voice(text):
     async for chunk in communicate.stream():
         if chunk["type"] == "audio": fp.write(chunk["data"])
     fp.seek(0)
-    return BufferedInputFile(fp.read(), filename="moti.ogg")
+    return types.BufferedInputFile(fp.read(), filename="moti.ogg")
 
 @dp.message()
 async def talk_handler(message: types.Message):
-    if message.chat.id not in ALLOWED_CHATS:
-        return
-
+    if message.chat.id not in ALLOWED_CHATS: return
     user_id = message.from_user.id
     text = (message.text or message.caption or "").lower()
     bot_info = await bot.get_me()
-
     is_moti = "моти" in text or "мотя" in text
     is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_info.id
     
@@ -90,7 +96,7 @@ async def talk_handler(message: types.Message):
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
         async with db_pool.acquire() as conn:
             rep = await conn.fetchval("SELECT points FROM user_rep WHERE user_id = $1", user_id) or 5.0
-
+        
         prompt = f"{INSTRUCTIONS}\nРепа: {rep}/5\n"
         if ocr_text: prompt += f"(Текст на фото: {ocr_text})\n"
         prompt += f"Юзер: {text}"
@@ -102,15 +108,13 @@ async def talk_handler(message: types.Message):
             try:
                 genai.configure(api_key=key)
                 model = genai.GenerativeModel("gemini-1.5-flash")
-                response = await asyncio.to_thread(model.generate_content, prompt)
-                reply_text = response.text.replace("*", "")
-                mark_key_success(key)
+                res = await asyncio.to_thread(model.generate_content, prompt)
+                reply_text = res.text.replace("*", "")
+                if key in failed_keys: failed_keys[key]['fails'] = 0
                 break
-            except:
-                mark_key_failed(key)
+            except: mark_key_failed(key)
 
         if not reply_text: return
-
         async with db_pool.acquire() as conn:
             await conn.execute("INSERT INTO chat_history (chat_id, role, content) VALUES ($1, $2, $3)", message.chat.id, message.from_user.first_name, text)
 
@@ -122,7 +126,7 @@ async def talk_handler(message: types.Message):
 
 async def main():
     await init_db()
-    await dp.start_polling(bot)
+    await asyncio.gather(start_web_server(), dp.start_polling(bot))
 
 if __name__ == "__main__":
     asyncio.run(main())
