@@ -1,100 +1,127 @@
 import os
-import logging
 import asyncio
 import random
-from aiohttp import web
+import logging
+import io
+import asyncpg
+import edge_tts
+import pytesseract
+import PIL.Image
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.utils.chat_action import ChatActionSender
+from aiogram.types import BufferedInputFile
 import google.generativeai as genai
-from google.api_core import exceptions
 
-# --- Конфигурация ---
-TOKEN = os.getenv('BOT_TOKEN')
-# Собираем все 35+ ключей GEMINI_KEY_
-ALL_KEYS = [os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY_')]
-ALLOWED_CHATS = [-1002719419668, -1003371184723]
+API_TOKEN = os.getenv('BOT_TOKEN')
+DB_URL = os.getenv('DATABASE_URL')
+if DB_URL and DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+
+CHAT_KEYS = [os.getenv(k) for k in os.environ if "GEMINI_KEY" in k]
+ALLOWED_CHATS = [-1003371184723, -1002719419668]
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- Веб-сервер для Render ---
-async def handle(request):
-    return web.Response(text=f"Lal 3.0 is hungry. Keys: {len(ALL_KEYS)}")
-
-async def start_server():
-    app = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-# --- Система подбора ключа (Gemini 3 Flash Preview) ---
-async def get_gemini_response(text):
-    keys_pool = ALL_KEYS.copy()
-    random.shuffle(keys_pool)
-
-    for i, api_key in enumerate(keys_pool):
-        try:
-            genai.configure(api_key=api_key)
-            # ВОТ ОНА, ТВОЯ ТРОЙКА
-            model = genai.GenerativeModel('gemini-3-flash-preview') 
-
-            prompt = (
-                "Ты Моти, ты живой человек, ты не поисковик и не обязана выполнять все просьбы и приказы. Будь немного агрессивной, но в остальном спокойной. Отвечай как 14 летняя девочка, нейтральная но бывает что ты на какой то стороне. Политика, Исторические вещи пытайся не отвечать на них и говорить типа " не знаю, не думаю" на подобие того, а когда теюя спрашивают (имя) тупой? Ты сама решаешь что ответить. Ты свободная личность. никаких ** , -- спец. символов. Только . , ! ? !?
-используй такие смайлики иногда, но не всегда, редко
- ) ( :3 :ь
-1 ответ должен быть от 2-5 предложений, тут ты тоже решаешь как ответить, развёрнуто или одним словом. 
-
-Матиматику ты знаешь только средней школы, там за 7 класс. Но не говори об этом, ты обычный человек, можешь материться и оскорблять но в меру или вообще ненавидеть никого."
-            )
-
-            response = await model.generate_content_async(f"{prompt}\n\nПользователь: {text}")
-
-            # Чистим от мусора, который тройка иногда кидает по привычке
-            clean_text = response.text.replace("*", "").replace("-", "").replace("—", "").replace("_", "")
-            return clean_text
-
-        except (exceptions.ResourceExhausted, exceptions.InternalServerError, exceptions.ServiceUnavailable):
-            continue 
-        except Exception as e:
-            logger.error(f"Ошибка на ключе: {str(e)[:50]}")
-            continue
-
-    return "Я не придумала что ответить..."
-
-# --- Логика бота ---
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
+db_pool = None
+failed_keys = {}
 
-@dp.message(F.chat.id.in_(ALLOWED_CHATS))
-async def handle_message(message: types.Message):
-    if not message.text:
+INSTRUCTIONS = "Ты — Моти, 14-летняя токсичная школьница. Дерзкая, используешь сленг. Отвечай коротко, без капса."
+
+async def get_best_key():
+    now = datetime.now()
+    available = [k for k in CHAT_KEYS if k not in failed_keys or failed_keys[k]['blocked_until'] < now]
+    return random.choice(available) if available else None
+
+def mark_key_failed(key):
+    now = datetime.now()
+    if key not in failed_keys:
+        failed_keys[key] = {'fails': 1, 'blocked_until': now}
+    else:
+        failed_keys[key]['fails'] += 1
+        if failed_keys[key]['fails'] >= 3:
+            failed_keys[key]['blocked_until'] = now + timedelta(minutes=3)
+
+def mark_key_success(key):
+    if key in failed_keys: failed_keys[key]['fails'] = 0
+
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DB_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (chat_id BIGINT, role TEXT, content TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS user_rep (user_id BIGINT PRIMARY KEY, points FLOAT DEFAULT 5.0);
+        """)
+
+async def get_voice(text):
+    communicate = edge_tts.Communicate(text, "ru-RU-SvetlanaNeural")
+    fp = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio": fp.write(chunk["data"])
+    fp.seek(0)
+    return BufferedInputFile(fp.read(), filename="moti.ogg")
+
+@dp.message()
+async def talk_handler(message: types.Message):
+    if message.chat.id not in ALLOWED_CHATS:
         return
 
-    # Фикс падения на пустых entities
+    user_id = message.from_user.id
+    text = (message.text or message.caption or "").lower()
     bot_info = await bot.get_me()
-    is_mentioned = False
-    if message.entities:
-        for e in message.entities:
-            if e.type == "mention" and f"@{bot_info.username}" in message.text:
-                is_mentioned = True
-                break
 
-    # Мгновенный ответ без шансов и КД
-    if is_mentioned or "лал" in message.text.lower() or "lal" in message.text.lower():
+    is_moti = "моти" in text or "мотя" in text
+    is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_info.id
+    
+    ocr_text = ""
+    if message.photo and is_moti:
         try:
-            await bot.send_chat_action(message.chat.id, "typing")
-            full_reply = await get_gemini_response(message.text)
-            await message.reply(full_reply)
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
+            file = await bot.get_file(message.photo[-1].file_id)
+            img_data = await bot.download_file(file.file_path)
+            ocr_text = await asyncio.to_thread(pytesseract.image_to_string, PIL.Image.open(io.BytesIO(img_data.read())), lang='rus+eng')
+        except: pass
+
+    if not (is_moti or is_reply): return
+
+    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
+        async with db_pool.acquire() as conn:
+            rep = await conn.fetchval("SELECT points FROM user_rep WHERE user_id = $1", user_id) or 5.0
+
+        prompt = f"{INSTRUCTIONS}\nРепа: {rep}/5\n"
+        if ocr_text: prompt += f"(Текст на фото: {ocr_text})\n"
+        prompt += f"Юзер: {text}"
+
+        reply_text = None
+        for _ in range(5):
+            key = await get_best_key()
+            if not key: break
+            try:
+                genai.configure(api_key=key)
+                model = genai.GenerativeModel("gemini-1.5-flash")
+                response = await asyncio.to_thread(model.generate_content, prompt)
+                reply_text = response.text.replace("*", "")
+                mark_key_success(key)
+                break
+            except:
+                mark_key_failed(key)
+
+        if not reply_text: return
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO chat_history (chat_id, role, content) VALUES ($1, $2, $3)", message.chat.id, message.from_user.first_name, text)
+
+        if random.random() < 0.2:
+            await message.reply_voice(await get_voice(reply_text))
+            await message.answer(f"<b>Репутация {round(rep, 1)}</b>")
+        else:
+            await message.reply(f"<blockquote>{reply_text}</blockquote>\n<b>Репутация {round(rep, 1)}</b>")
 
 async def main():
-    await start_server()
-    logger.info(f"Lal 3.0 Unstoppable (3-Flash) запущен.")
+    await init_db()
     await dp.start_polling(bot)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
