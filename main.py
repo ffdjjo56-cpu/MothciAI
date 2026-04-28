@@ -98,7 +98,7 @@ async def handle_message(message: types.Message):
 
         try:
             genai.configure(api_key=active_key)
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            model = genai.GenerativeModel("gemini-2.5-flash")
             response = await asyncio.to_thread(model.generate_content, content)
             reply_text = response.text.replace("*", "").strip()
         except Exception as e:
