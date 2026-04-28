@@ -1,132 +1,150 @@
 import os
+import io
 import asyncio
 import random
 import logging
-import io
 import asyncpg
 import edge_tts
-import pytesseract
-import PIL.Image
+import google.generativeai as genai
 from datetime import datetime, timedelta
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.chat_action import ChatActionSender
-import google.generativeai as genai
-
-API_TOKEN = os.getenv('BOT_TOKEN')
-DB_URL = os.getenv('DATABASE_URL')
-if DB_URL and DB_URL.startswith("postgres://"):
-    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
-
-CHAT_KEYS = [os.getenv(k) for k in os.environ if "GEMINI_KEY" in k]
-raw_chats = os.getenv('ALLOWED_CHATS', '')
-ALLOWED_CHATS = [int(i.strip()) for i in raw_chats.split(',') if i.strip()]
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+logger = logging.getLogger("moti_bot")
+
+TOKEN = os.getenv('BOT_TOKEN')
+DB_URL = os.getenv('DATABASE_URL', '').replace("postgres://", "postgresql://", 1)
+KEYS = [os.getenv(k) for k in os.environ if "GEMINI_KEY" in k]
+CHATS = [int(i.strip()) for i in os.getenv('ALLOWED_CHATS', '').split(',') if i.strip()]
+
+PROMPT = (
+    "Ты — Моти, 14-летняя токсичная школьница. "
+    "Твой стиль: дерзость, сленг, короткие ответы без капса. "
+    "Ты не любишь тупые вопросы и всегда подкалываешь собеседника."
+)
+
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 db_pool = None
-failed_keys = {}
+key_cooldowns = {}
 
-INSTRUCTIONS = "Ты — Моти, 14-летняя токсичная школьница. Дерзкая, используешь сленг. Отвечай коротко, без капса."
-
-async def handle_health_check(request):
-    return web.Response(text="Moti is alive")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-
-async def get_best_key():
-    now = datetime.now()
-    available = [k for k in CHAT_KEYS if k not in failed_keys or failed_keys[k]['blocked_until'] < now]
-    return random.choice(available) if available else None
-
-def mark_key_failed(key):
-    now = datetime.now()
-    if key not in failed_keys:
-        failed_keys[key] = {'fails': 1, 'blocked_until': now}
-    else:
-        failed_keys[key]['fails'] += 1
-        if failed_keys[key]['fails'] >= 3:
-            failed_keys[key]['blocked_until'] = now + timedelta(minutes=3)
+async def get_db():
+    global db_pool
+    if not db_pool:
+        db_pool = await asyncpg.create_pool(DB_URL)
+    return db_pool
 
 async def init_db():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DB_URL)
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS chat_history (chat_id BIGINT, role TEXT, content TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
-            CREATE TABLE IF NOT EXISTS user_rep (user_id BIGINT PRIMARY KEY, points FLOAT DEFAULT 5.0);
-        """)
+    pool = await get_db()
+    await pool.execute("DROP TABLE IF EXISTS chat_logs CASCADE;")
+    await pool.execute("DROP TABLE IF EXISTS user_rep CASCADE;")
+    await pool.execute("""
+        CREATE TABLE IF NOT EXISTS user_rep (
+            user_id BIGINT PRIMARY KEY, 
+            points FLOAT DEFAULT 5.0
+        );
+        CREATE TABLE IF NOT EXISTS chat_logs (
+            chat_id BIGINT, 
+            role TEXT, 
+            msg TEXT, 
+            dt TIMESTAMP DEFAULT NOW()
+        );
+    """)
 
-async def get_voice(text):
-    communicate = edge_tts.Communicate(text, "ru-RU-SvetlanaNeural")
-    fp = io.BytesIO()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio": fp.write(chunk["data"])
-    fp.seek(0)
-    return types.BufferedInputFile(fp.read(), filename="moti.ogg")
+async def get_working_key():
+    now = datetime.now()
+    available = [k for k in KEYS if k not in key_cooldowns or key_cooldowns[k] < now]
+    return random.choice(available) if available else None
 
 @dp.message()
-async def talk_handler(message: types.Message):
-    if message.chat.id not in ALLOWED_CHATS: return
-    user_id = message.from_user.id
-    text = (message.text or message.caption or "").lower()
-    bot_info = await bot.get_me()
-    is_moti = "моти" in text or "мотя" in text
-    is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_info.id
-    
-    ocr_text = ""
-    if message.photo and is_moti:
-        try:
-            file = await bot.get_file(message.photo[-1].file_id)
-            img_data = await bot.download_file(file.file_path)
-            ocr_text = await asyncio.to_thread(pytesseract.image_to_string, PIL.Image.open(io.BytesIO(img_data.read())), lang='rus+eng')
-        except: pass
+async def handle_message(message: types.Message):
+    if message.chat.id not in CHATS:
+        return
 
-    if not (is_moti or is_reply): return
+    bot_user = await bot.get_me()
+    text = (message.text or message.caption or "").lower()
+    
+    is_called = any(name in text for name in ["мотя", "моти"])
+    is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_user.id
+    
+    if not (is_called or is_reply):
+        return
+
+    pool = await get_db()
+    user_id = message.from_user.id
+    rep = await pool.fetchval("SELECT points FROM user_rep WHERE user_id = $1", user_id) or 5.0
+
+    rows = await pool.fetch(
+        "SELECT role, msg FROM chat_logs WHERE chat_id = $1 ORDER BY dt DESC LIMIT 5", 
+        message.chat.id
+    )
+    history = "\n".join([f"{r['role']}: {r['msg']}" for r in reversed(rows)])
+
+    full_prompt = f"{PROMPT}\nИстория:\n{history}\nЧелик (репа {round(rep, 1)}): {text}"
+    content = [full_prompt]
+
+    if message.photo:
+        file = await bot.get_file(message.photo[-1].file_id)
+        img_bytes = await bot.download_file(file.file_path)
+        content.append({"mime_type": "image/jpeg", "data": img_bytes.read()})
 
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        async with db_pool.acquire() as conn:
-            rep = await conn.fetchval("SELECT points FROM user_rep WHERE user_id = $1", user_id) or 5.0
-        
-        prompt = f"{INSTRUCTIONS}\nРепа: {rep}/5\n"
-        if ocr_text: prompt += f"(Текст на фото: {ocr_text})\n"
-        prompt += f"Юзер: {text}"
+        active_key = await get_working_key()
+        if not active_key:
+            return
 
-        reply_text = None
-        for _ in range(5):
-            key = await get_best_key()
-            if not key: break
-            try:
-                genai.configure(api_key=key)
-                model = genai.GenerativeModel("gemini-1.5-flash")
-                res = await asyncio.to_thread(model.generate_content, prompt)
-                reply_text = res.text.replace("*", "")
-                if key in failed_keys: failed_keys[key]['fails'] = 0
-                break
-            except: mark_key_failed(key)
+        try:
+            genai.configure(api_key=active_key)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = await asyncio.to_thread(model.generate_content, content)
+            reply_text = response.text.replace("*", "").strip()
+        except Exception as e:
+            logger.error(f"Gemini Error: {e}")
+            key_cooldowns[active_key] = datetime.now() + timedelta(minutes=3)
+            return
 
-        if not reply_text: return
-        async with db_pool.acquire() as conn:
-            await conn.execute("INSERT INTO chat_history (chat_id, role, content) VALUES ($1, $2, $3)", message.chat.id, message.from_user.first_name, text)
+        await pool.execute(
+            "INSERT INTO chat_logs (chat_id, role, msg) VALUES ($1, $2, $3), ($1, $4, $5)",
+            message.chat.id, "Юзер", text[:200], "Моти", reply_text[:200]
+        )
+
+        rep_label = f"<b>Репутация {round(rep, 1)}</b>"
 
         if random.random() < 0.2:
-            await message.reply_voice(await get_voice(reply_text))
-            await message.answer(f"<b>Репутация {round(rep, 1)}</b>")
-        else:
-            await message.reply(f"<blockquote>{reply_text}</blockquote>\n<b>Репутация {round(rep, 1)}</b>")
+            try:
+                tts = edge_tts.Communicate(reply_text, "ru-RU-SvetlanaNeural")
+                audio_stream = io.BytesIO()
+                async for chunk in tts.stream():
+                    if chunk["type"] == "audio":
+                        audio_stream.write(chunk["data"])
+                audio_stream.seek(0)
+                await message.reply_voice(
+                    types.BufferedInputFile(audio_stream.read(), filename="moti.ogg")
+                )
+                await message.answer(rep_label)
+                return
+            except Exception as e:
+                logger.error(f"TTS Error: {e}")
+
+        await message.reply(f"<blockquote>{reply_text}</blockquote>\n{rep_label}")
 
 async def main():
     await init_db()
-    await asyncio.gather(start_web_server(), dp.start_polling(bot))
+    
+    app = web.Application()
+    app.router.add_get('/', lambda r: web.Response(text="Moti is active"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    await web.TCPSite(runner, '0.0.0.0', port).start()
+    
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
