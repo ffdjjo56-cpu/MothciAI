@@ -1,155 +1,170 @@
 import os
-import io
-import asyncio
-import random
 import logging
-import asyncpg
-import edge_tts
-import google.generativeai as genai
-from datetime import datetime, timedelta
-from aiohttp import web
+import asyncio
+import time
+import random
+import re
+import aiohttp
+import psycopg2
+import pytz
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.chat_action import ChatActionSender
+from aiohttp import web
+import google.generativeai as genai
+
+# --- Конфигурация ---
+API_TOKEN = os.getenv('BOT_TOKEN')
+DB_URL = os.getenv('DATABASE_URL')
+CHAT_KEYS = sorted([os.getenv(k) for k in os.environ if k.startswith('GEMINI_KEY')])
+RENDER_URL = os.getenv('RENDER_EXTERNAL_URL')
+
+ALLOWED_CHATS = [-1002719419668, -1003371184723]
+bot_id = None
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("moti_bot")
+logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv('BOT_TOKEN')
-DB_URL = os.getenv('DATABASE_URL', '').replace("postgres://", "postgresql://", 1)
-KEYS = [os.getenv(k) for k in os.environ if "GEMINI_KEY" in k]
-CHATS = [int(i.strip()) for i in os.getenv('ALLOWED_CHATS', '').split(',') if i.strip()]
+# --- База данных Neon (500 сообщений) ---
+def init_db():
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("DROP TABLE IF EXISTS chat_history")
+        cur.execute("""
+            CREATE TABLE chat_history (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("БД инициализирована.")
+    except Exception as e:
+        logger.error(f"Ошибка БД: {e}")
 
-PROMPT = (
-    "Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и  оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки которая шарит в музыке. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 7 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно."
-)
+def save_message(chat_id, role, content):
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO chat_history (chat_id, role, content) VALUES (%s, %s, %s)", (chat_id, role, content))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка сохранения: {e}")
 
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+def get_history(chat_id, limit=500): # Увеличено до 500
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT role, content FROM (
+                SELECT role, content, created_at FROM chat_history
+                WHERE chat_id = %s
+                ORDER BY created_at DESC LIMIT %s
+            ) sub ORDER BY created_at ASC
+        """, (chat_id, limit))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return "\n".join([f"{r}: {c}" for r, c in rows])
+    except Exception as e:
+        logger.error(f"Ошибка истории: {e}")
+        return ""
+
+instructions = """
+Моти это ты. Ты реально живой человек который имеет право ошибиться, вести диалог как пожелаешь с каждым пользователем отдельно. Ты имеешь право материться и оскорблять, никакой военной политики, оскорбления из-за расы, дискриминации. Тебе 14 лет. Интеллект как у обычной 14 летней девочки. Ты не поисковик и не обязана отвечать на все вопросы грамотно и верно, так же у тебя есть выбор, оскорблять человека и его родителей или же нет. Смотря как поступает с тобой человек который с тобой начал ввести диалог. Предложения до 12 предложений. Если ответ не требует раскрытого ответа то сокращай как тебе угодно. Не используй выделение текста звездочками ** и смайлики. Ты можешь проявлять симпатию.
+"""
+
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
-db_pool = None
-key_cooldowns = {}
 
-async def get_db():
-    global db_pool
-    if not db_pool:
-        db_pool = await asyncpg.create_pool(DB_URL)
-    return db_pool
+def clean_text(text):
+    if not text: return ""
+    cleaned = re.sub(r'[^\w\s!?,.:\-\(\)@]', '', text)
+    return f"<blockquote expandable>{cleaned}</blockquote>"
 
-async def init_db():
-    pool = await get_db()
-    await pool.execute("""
-        CREATE TABLE IF NOT EXISTS user_rep (
-            user_id BIGINT PRIMARY KEY, 
-            points FLOAT DEFAULT 5.0
-        );
-        CREATE TABLE IF NOT EXISTS chat_logs (
-            chat_id BIGINT, 
-            role TEXT, 
-            msg TEXT, 
-            dt TIMESTAMP DEFAULT NOW()
-        );
-    """)
+async def keep_alive():
+    if not RENDER_URL: return
+    await asyncio.sleep(30)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(RENDER_URL) as resp:
+                    logger.info(f"Статус само-пинга: {resp.status}")
+            except: pass
+            await asyncio.sleep(840)
 
-async def get_working_key():
-    now = datetime.now()
-    available = [k for k in KEYS if k not in key_cooldowns or key_cooldowns[k] < now]
-    return random.choice(available) if available else None
+async def handle(request):
+    return web.Response(text="Moti 500msg Memory Active")
 
 @dp.message()
-async def handle_message(message: types.Message):
-    if message.chat.id not in CHATS:
+async def talk_handler(message: types.Message):
+    global bot_id
+
+    # Режим сна (01:00 - 07:00 МСК)
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    now = datetime.now(moscow_tz)
+    if 1 <= now.hour < 7:
         return
 
-    bot_user = await bot.get_me()
-    text = (message.text or message.caption or "").lower()
-    
-    is_called = any(name in text for name in ["мотя", "моти"])
-    is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_user.id
-    
-    if not (is_called or is_reply):
-        return
+chat_id = message.chat.id
+    if chat_id not in ALLOWED_CHATS and message.chat.type != "private": return
+    if message.date.timestamp() < time.time() - 30: return
 
-    pool = await get_db()
-    user_id = message.from_user.id
-    
-    rep = await pool.fetchval("SELECT points FROM user_rep WHERE user_id = $1", user_id)
-    if rep is None:
-        rep = 5.0
-        await pool.execute("INSERT INTO user_rep (user_id, points) VALUES ($1, $2)", user_id, rep)
+    text_content = (message.text or message.caption or "").lower()
+    is_mochi = "моти" in text_content
+    is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_id
 
-    rows = await pool.fetch(
-        "SELECT role, msg FROM chat_logs WHERE chat_id = $1 ORDER BY dt DESC LIMIT 5", 
-        message.chat.id
-    )
-    history = "\n".join([f"{r['role']}: {r['msg']}" for r in reversed(rows)])
+    if not (is_mochi or is_reply): return
 
-    full_prompt = f"{PROMPT}\nИстория:\n{history}\nЧелик (репа {round(rep, 1)}): {text}"
-    content = [full_prompt]
+    # Получаем ник или имя пользователя для памяти
+    user_display = message.from_user.username or message.from_user.first_name or "Аноним"
 
-    if message.photo:
-        file = await bot.get_file(message.photo[-1].file_id)
-        img_bytes = await bot.download_file(file.file_path)
-        content.append({"mime_type": "image/jpeg", "data": img_bytes.read()})
+    async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
+        # Сохраняем с ником пользователя
+        await asyncio.to_thread(save_message, chat_id, user_display, text_content)
+        history_context = await asyncio.to_thread(get_history, chat_id)
 
-    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        active_key = await get_working_key()
-        if not active_key:
-            return
+        full_prompt = f"История диалога:\n{history_context}\nТы - Моти. Ответь пользователю {user_display}: {text_content}"
 
-        try:
-            genai.configure(api_key=active_key)
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            response = await asyncio.to_thread(model.generate_content, content)
-            reply_text = response.text.replace("*", "").strip()
-        except Exception as e:
-            logger.error(f"Gemini Error: {e}")
-            key_cooldowns[active_key] = datetime.now() + timedelta(minutes=5)
-            return
-
-        diff = random.uniform(-0.1, 0.1)
-        if any(w in text for w in ["спс", "спасибо", "крутая", "люблю"]): diff += 0.3
-        if any(w in text for w in ["дура", "тупая", "бесишь"]): diff -= 0.4
-        
-        rep = max(0.0, min(10.0, rep + diff))
-        await pool.execute("UPDATE user_rep SET points = $1 WHERE user_id = $2", rep, user_id)
-
-        await pool.execute(
-            "INSERT INTO chat_logs (chat_id, role, msg) VALUES ($1, $2, $3), ($1, $4, $5)",
-            message.chat.id, "Юзер", text[:200], "Моти", reply_text[:200]
-        )
-
-        rep_label = f"<b>Репутация {round(rep, 1)}</b>"
-
-        if random.random() < 0.2:
+        pool = CHAT_KEYS
+        random.shuffle(pool)
+        for key in pool[:5]:
             try:
-                tts = edge_tts.Communicate(reply_text, "ru-RU-SvetlanaNeural")
-                audio_stream = io.BytesIO()
-                async for chunk in tts.stream():
-                    if chunk["type"] == "audio":
-                        audio_stream.write(chunk["data"])
-                audio_stream.seek(0)
-                await message.reply_voice(
-                    types.BufferedInputFile(audio_stream.read(), filename="moti.ogg")
-                )
-                await message.answer(rep_label)
-                return
-            except Exception:
-                pass
+                genai.configure(api_key=key)
+                model = genai.GenerativeModel("gemini-3-flash-preview", system_instruction=instructions)
+                response = await asyncio.to_thread(model.generate_content, full_prompt)
 
-        await message.reply(f"<blockquote>{reply_text}</blockquote>\n{rep_label}")
+                if response and response.text:
+                    await asyncio.to_thread(save_message, chat_id, "Моти", response.text)
+                    await message.reply(clean_text(response.text))
+                    return
+            except Exception as e:
+                logger.error(f"Ошибка ключа: {e}")
+                continue
 
 async def main():
-    await init_db()
-    app = web.Application()
-    app.router.add_get('/', lambda r: web.Response(text="Moti Active"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 10000))
-    await web.TCPSite(runner, '0.0.0.0', port).start()
+    global bot_id
+    init_db()
+    app = web.Application(); app.router.add_get("/", handle)
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+
+    asyncio.create_task(keep_alive())
+    await bot.delete_webhook(drop_pending_updates=True)
+    me = await bot.get_me()
+    bot_id = me.id
+    logger.info("Моти запущена (Memory: 500).")
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if name == '__main__':
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    except: pass
